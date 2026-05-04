@@ -1,0 +1,7 @@
+# API keys — jangan pernah di-commit
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
