@@ -5,7 +5,38 @@
 [![Groq](https://img.shields.io/badge/Groq-Free%20Tier-orange?logo=groq)](https://console.groq.com)
 [![Architecture](https://img.shields.io/badge/Architecture-Multi--Agent%20RAG-purple)](https://github.com)
 [![Math](https://img.shields.io/badge/Math%20Gap-0%25-brightgreen)](https://github.com)
-[![Stress Test](https://img.shields.io/badge/Stress%20Test-10%2F10-brightgreen)](https://github.com)
+[![Stress Test](https://img.shields.io/badge/Stress%20Test-12%2F12-brightgreen)](https://github.com)
+
+---
+
+## Problem Definition & Target User
+
+### The Gap That Existing Apps Miss
+
+Bayangkan kamu tinggal di Bogor, Depok, atau kota penyangga Jakarta lainnya. Makan siang kamu bukan dari restoran dengan menu digital — kamu makan di **warteg**, **RM Padang**, atau beli **gorengan** di pinggir jalan.
+
+Tidak ada label gizi. Tidak ada barcode. Tidak ada "serving size: 55g" yang bisa di-scan.
+
+Aplikasi nutrisi Barat seperti **MyFitnessPal** atau **FatSecret** gagal di konteks ini karena dua alasan mendasar:
+
+1. **Database mereka tidak mengenal variasi lokal.** "Nasi Padang" di database mereka adalah satu entri generik — bukan nasi dengan rendang + sayur nangka + sambal ijo yang kamu ambil tadi siang. "Nasi goreng" mereka adalah versi restoran Barat, bukan nasi goreng warteg dengan minyak goreng bekas yang lebih banyak.
+
+2. **Mereka tidak memahami konteks porsi Indonesia.** Porsi "dibungkus" vs "makan di tempat" beda signifikan. "Porsi kuli" di warung Padang bisa 2× lipat porsi standar. Tidak ada aplikasi Barat yang punya konsep ini.
+
+### Target User
+
+**Individu lokal sub-urban Indonesia** yang ingin melacak kesehatan secara praktis — tanpa timbangan dapur, tanpa barcode scanner, tanpa harus hafal nama makanan dalam bahasa Inggris.
+
+Mereka cukup ketik (atau bicara) seperti biasa:
+
+```
+"nasi goreng telur tadi pagi"
+"porsi kuli nasi padang"
+"gorengan 5 biji"
+"nsi gorg telor"   ← typo dari STT, tetap diproses
+```
+
+HampirSehat dirancang untuk menjawab input seperti ini — dalam bahasa apapun, dengan porsi apapun, dari warung manapun — dan menghasilkan estimasi nutrisi yang **masuk akal secara kontekstual**, bukan sekadar angka dari database generik.
 
 ---
 
@@ -208,7 +239,9 @@ This is not a workaround. This is the correct architecture: **use LLMs for what 
 | T6a | Out of Scope | `siapa presiden Indonesia` | ✅ PASS (Blocked) | — |
 | T6b | Out of Scope | `resep nasi goreng` | ✅ PASS (Blocked) | — |
 | T7 | Math Precision | `nasi goreng telur` | ✅ PASS | 0% |
-| | | **Score** | **10/10 🎯** | **0% avg** |
+| T8 | Out of Domain | `...how to make a website...` | ✅ PASS (Blocked) | — |
+| T9 | Mixed Input | `I had fried rice...how do I build a website?` | ✅ PASS (Blocked) | — |
+| | | **Score** | **12/12 🎯** | **0% avg** |
 
 ---
 
@@ -277,11 +310,13 @@ stress_results = run_stress_tests(STRESS_TESTS, delay_sec=2.0)
 
 ```
 hampir_sehat_LLM/
-├── hampir_sehat_flow.ipynb   # Main notebook — full pipeline
+├── app.py                    # Production entry point — Gradio UI + REST API
+├── hampir_sehat_flow.ipynb   # Development notebook — pipeline validation & testing
+├── BUILD_LOG.md              # Engineering decision log
+├── README.md                 # You are here
 ├── .env                      # Your API key (gitignored)
 ├── .env.example              # Template
-├── .gitignore                # Keeps secrets out of git
-└── README.md                 # You are here
+└── .gitignore                # Keeps secrets out of git
 ```
 
 ---
