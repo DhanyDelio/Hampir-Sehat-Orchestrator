@@ -1044,7 +1044,7 @@ def gradio_assess(user_input: str) -> str:
     return _format_human_readable(user_input, result)
 
 
-with gr.Blocks(title="HampirSehat — Nutrition Analyzer", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="HampirSehat — Nutrition Analyzer") as demo:
     gr.Markdown("""
     # 🥗 HampirSehat
     ### Your personal nutrition analyzer — powered by multi-agent AI
@@ -1085,7 +1085,6 @@ with gr.Blocks(title="HampirSehat — Nutrition Analyzer", theme=gr.themes.Soft(
                 label     = "Your nutrition breakdown",
                 lines     = 22,
                 max_lines = 30,
-                show_copy_button = True,
             )
 
     submit_btn.click(fn=gradio_assess, inputs=input_box, outputs=output_box)
@@ -1099,5 +1098,5 @@ with gr.Blocks(title="HampirSehat — Nutrition Analyzer", theme=gr.themes.Soft(
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, theme=gr.themes.Soft())
 
