@@ -943,25 +943,59 @@ def _format_human_readable(user_input: str, result: dict) -> str:
                 if any(kw in raw_lower for kw in kws)}
 
     if detected:
-        meal_lines = []
+        # Build per-slot segments — no character limit, full text shown
+        slot_segments = {}
         for slot_label, kws in time_slots.items():
             if not any(kw in raw_lower for kw in kws):
                 continue
-            segment = user_input
             for kw in kws:
                 idx = raw_lower.find(kw)
                 if idx != -1:
-                    segment = user_input[idx:idx + 80].strip()
-                    for other_kws in time_slots.values():
+                    # Start from the keyword position, no length cap
+                    segment = user_input[idx:].strip()
+                    # Trim at the NEXT time-slot keyword (not the current one)
+                    earliest_cut = len(segment)
+                    for other_label, other_kws in time_slots.items():
+                        if other_label == slot_label:
+                            continue
                         for okw in other_kws:
                             cut = segment.lower().find(okw)
-                            if cut > 5:
-                                segment = segment[:cut].strip()
+                            if cut > len(kw):   # must be after the current keyword
+                                earliest_cut = min(earliest_cut, cut)
+                    segment = segment[:earliest_cut].strip().rstrip(',. ')
+                    slot_segments[slot_label] = segment
                     break
-            meal_lines.append(f"  • {slot_label}: {segment.rstrip(',. ')}")
+
+        meal_lines = [f"  • {label}: {seg}" for label, seg in slot_segments.items()]
         waktu_makan = "\n".join(meal_lines)
+
+        # ── Issue 3: Deduplication check ─────────────────────────────────
+        # If the same food keyword appears in more than one slot, flag it.
+        # We check for word-level overlap between segments (min 4 chars to avoid
+        # false positives on short words like "dan", "dan", "di").
+        all_segments = list(slot_segments.values())
+        overlap_found = False
+        if len(all_segments) > 1:
+            word_sets = []
+            for seg in all_segments:
+                words = {w.lower() for w in seg.split() if len(w) >= 4}
+                word_sets.append(words)
+            for i in range(len(word_sets)):
+                for j in range(i + 1, len(word_sets)):
+                    if word_sets[i] & word_sets[j]:   # non-empty intersection
+                        overlap_found = True
+                        break
+                if overlap_found:
+                    break
+
+        if overlap_found:
+            catatan = (
+                "⚠️ Similar items detected across meal sessions — "
+                "verify if meals were logged separately."
+            )
     else:
         waktu_makan = "  Session: Single Meal"
+        overlap_found = False
 
     # ── Assemble clean output ─────────────────────────────────────────────
     output = (
