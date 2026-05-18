@@ -904,7 +904,45 @@ The entire pipeline — `rag_search()`, `front_office_clean()`, `collect_agent_o
 
 ---
 
-## 22. NEXT STEPS
+## 22. HOTFIX — Gradio 6.0 Breaking Changes (May 19, 2026)
+
+### Incident
+
+Hugging Face Spaces deployment crashed on startup with two errors:
+
+```
+TypeError: Textbox.__init__() got an unexpected keyword argument 'show_copy_button'
+UserWarning: The parameters have been moved from the Blocks constructor to the
+launch() method in Gradio 6.0: theme.
+```
+
+### Root Cause
+
+Gradio 6.0 introduced two breaking API changes that were not present in the version used during local development:
+
+1. `theme` parameter was removed from `gr.Blocks()` constructor — it must now be passed to `demo.launch()` instead.
+2. `show_copy_button` parameter was removed from `gr.Textbox.__init__()`.
+
+### Fix — Three Surgical Edits
+
+| Location | Before | After |
+|----------|--------|-------|
+| `gr.Blocks(...)` | `gr.Blocks(title=..., theme=gr.themes.Soft())` | `gr.Blocks(title=...)` |
+| `gr.Textbox(...)` output box | `show_copy_button=True` present | parameter removed entirely |
+| `demo.launch(...)` | `demo.launch(server_name=..., server_port=..., share=False)` | `demo.launch(..., theme=gr.themes.Soft())` |
+
+All layout, labels, placeholder text, examples, and markdown descriptions were left untouched. Only the three API-incompatible parameters were changed.
+
+### Verification
+
+- Syntax check: **1102 lines, 0 errors**
+- `theme` confirmed absent from `gr.Blocks()` constructor
+- `show_copy_button` confirmed absent from entire file
+- `theme=gr.themes.Soft()` confirmed present in `demo.launch()`
+
+---
+
+## 23. NEXT STEPS
 
 - [ ] Wrap `assess()` into a FastAPI endpoint (`POST /analyze`)
 - [ ] Add Redis caching layer for frequent queries (~60-80% hit rate target)
