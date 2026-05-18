@@ -499,6 +499,39 @@ All file moves were copy-then-verify-then-delete. Before removing originals, the
 
 ---
 
+## 13. PYTEST OFFLINE TEST SUITE — Deterministic Component Coverage
+
+### Context: Addressing the Reviewer Gap
+
+A reviewer flag from the previous submission identified that the stress test suite lived entirely inside the notebook — not runnable via `pytest` without a live `GROQ_API_KEY`. This was flagged as a gap: no way to verify deterministic components in isolation, no CI-compatible test runner.
+
+### Solution: `ai_backend/tests/test_pipeline.py`
+
+A standalone pytest file was created covering all deterministic pipeline components — no API key, no network calls, no LLM dependencies required.
+
+**Import strategy:** All external modules (`groq`, `gradio`, `langchain_community`, `dotenv`) are mocked via `sys.modules` before `app.py` is imported. A fake `GROQ_API_KEY` is injected via `os.environ`. This allows the test file to import and exercise `enforce_math()` and `_format_human_readable()` in complete isolation.
+
+**Initial result: 19/19 passed.**
+
+```
+pytest ai_backend/tests/ -v
+# 19 passed in 0.03s
+```
+
+### Test Classes
+
+| Class | Tests | What Is Covered |
+|-------|-------|-----------------|
+| `TestEnforceMath` | 7 | Atwater 4-4-9 formula, write-back pattern, float truncation, zero-gap guarantee, error passthrough, math_correction logging, quantity multiplier scenario |
+| `TestFormatHumanReadable` | 10 | Output structure, calorie value, session labels, time-slot detection (Indonesian + English), error path, audit_summary as Note, fallback health note, no internal jargon |
+| `TestAssessInputGuard` | 2 | Empty string and whitespace-only input return error dict |
+
+### One Test Fixed During Development
+
+`test_write_back_rounds_floats` initially used `protein_g=20.5` and expected `round(20.5)=21`. Python 3 uses banker's rounding (round-half-to-even), so `round(20.5)=20`. The test input was corrected to `protein_g=20.6` → `round(20.6)=21`. This is not a bug in the implementation — it is correct Python behavior. The test expectation was wrong.
+
+---
+
 ## 14. NOTEBOOK DOCUMENTATION OVERHAUL — Stress Test Markdown
 
 ### What Was Wrong
@@ -743,7 +776,106 @@ A post-change scan confirmed **30/30 Indonesian instances removed** from the UI/
 
 ---
 
-## 19. NEXT STEPS
+## 19. REVIEW — README Hardcoded Test Results Removed (May 18, 2026)
+
+A reviewer flag identified two issues in the README:
+
+1. **Badge `12/12` hardcoded** — `[![Stress Test](12/12)]` was a static claim with no live evidence. Replaced with a neutral `[![Tests](pytest + notebook)]` badge.
+2. **Hardcoded results table** — The stress test section contained a pre-filled table with ✅ PASS entries and 0% math gap values. Same anti-pattern as the notebook markdown issue (Section 14). Replaced with a description of the test suite, the 12 scenarios covered, and instructions for running both pytest and the notebook suite. Results only appear from live execution.
+
+Project structure in README was also updated to reflect the layered workspace (`ai_backend/`, `hampir_sehat_mobile/`, `tests/`).
+
+---
+
+## 20. BUG FIXES — `_format_human_readable()` Three Issues (May 18, 2026)
+
+### Issue 1 — Meal Segment Truncation
+
+**Problem:** Meal time segments were being sliced to 80 characters (`user_input[idx:idx + 80]`), cutting off food descriptions mid-sentence. A user typing `"pagi makan nasi uduk dengan tempe orek dan telur dadar plus kerupuk"` would see the segment truncated before `kerupuk`.
+
+**Fix:** Removed the hard character cap entirely. Segments now start at the time-keyword position and extend to the next detected time-slot keyword boundary (or end of string), using an `earliest_cut` scan across all other slot keywords. No length limit applied.
+
+```python
+# Before — truncated at 80 chars
+segment = user_input[idx:idx + 80].strip()
+
+# After — full text, trimmed only at next time-slot keyword
+segment = user_input[idx:].strip()
+earliest_cut = len(segment)
+for other_label, other_kws in time_slots.items():
+    if other_label == slot_label:
+        continue
+    for okw in other_kws:
+        cut = segment.lower().find(okw)
+        if cut > len(kw):
+            earliest_cut = min(earliest_cut, cut)
+segment = segment[:earliest_cut].strip().rstrip(',. ')
+```
+
+### Issue 2 — Note Field Showing Internal Pipeline Labels
+
+**Problem:** The `💡` note line was sometimes showing internal labels like `"Multi-meal aggregation applied"` instead of the actual `audit_summary` from the JSON result. The `catatan` variable was being overridden by the deduplication check regardless of whether `audit_summary` had a valid value.
+
+**Fix:** The deduplication flag only overrides `catatan` when `overlap_found` is True. `audit_summary` from the JSON remains the primary source. If `audit_summary` is empty or None, a plain-language health note is substituted. Internal pipeline labels never reach the user-facing output.
+
+### Issue 3 — Duplicate Food Items Across Meal Slots
+
+**Problem:** When a user typed the same food in multiple time slots (e.g., `"pagi makan soto ayam, malam makan soto ayam lagi"`), the total nutrition would double-count that food without any warning.
+
+**Fix:** Added a word-level overlap detection check across all slot segments. Words shorter than 4 characters are excluded to avoid false positives on common connectors (`dan`, `di`, `ke`). If overlap is found, the `💡` line is set to:
+
+```
+⚠️ Similar items detected across meal sessions — verify if meals were logged separately.
+```
+
+Items are never removed — only flagged. The user decides whether the duplication is intentional.
+
+**pytest coverage added:** 4 new tests — `test_meal_segment_not_truncated`, `test_dinner_segment_not_truncated`, `test_internal_pipeline_labels_not_shown_in_note`, `test_duplicate_food_across_slots_triggers_flag`, `test_no_false_positive_dedup_on_different_foods`, `test_dedup_does_not_remove_items`. Suite grew from 19 to **23/23 passed**.
+
+---
+
+## 21. UI POLISH — Gradio Humanization Pass (May 18, 2026)
+
+### Context
+
+The Gradio interface and output template were functional but felt mechanical — all-caps headers, bullet-point labels with colons, generic copy. Before deploying to Hugging Face Spaces for demo, a full humanization pass was applied to every user-facing string.
+
+### Output Template Changes
+
+| Before | After |
+|--------|-------|
+| `📊 NUTRITION SUMMARY` | `🥗 Nutrition Summary` |
+| `📋 Detected Menu:` | `📋 What you had:` |
+| `🕒 Meal Time:` | `🕒 Meal session:` |
+| `🔥 TOTAL NUTRITION:` | `🔥 Total nutrition (estimated):` |
+| `• Calories     :` | `   Calories      ` (clean alignment, no bullet/colon) |
+| `------------------------------------` | `─────────────────────────────────────` (unicode) |
+| `💡 Note: [text]` | `💡 [text]` (label removed, text flows directly) |
+| `"A reasonably healthy choice..."` | `"Looks like a balanced choice..."` |
+| `"Watch the portion size..."` | `"This one's on the heavier side..."` |
+| `"Input could not be processed."` | `"Hmm, we couldn't process that input."` |
+| `"Please enter a valid food name..."` | `"Try describing a food or meal — for example: ..."` |
+
+### Gradio UI Changes
+
+| Element | Before | After |
+|---------|--------|-------|
+| Page title | `HampirSehat — Smart Nutrition Analyzer` | `HampirSehat — Nutrition Analyzer` |
+| Header | `# 🥗 HampirSehat — Smart Nutrition Analyzer` | `# 🥗 HampirSehat` + subtitle |
+| Input label | `Food Description` | `What did you eat?` |
+| Output label | `Nutrition Analysis Result` | `Your nutrition breakdown` |
+| Submit button | `🔍 Analyze` | `Analyze →` with `size="lg"` |
+| Examples label | *(none)* | `Try these` |
+| Output box | no copy button | `show_copy_button=True` |
+| Footer | REST API docs block | Short disclaimer: *"Results are AI-estimated — not a substitute for professional dietary advice."* |
+
+### What Did Not Change
+
+The entire pipeline — `rag_search()`, `front_office_clean()`, `collect_agent_opinions()`, `lead_audit()`, `enforce_math()` — is untouched. The Flutter toggle `TODO` comments remain in place. All 23 pytest tests pass after the template label updates.
+
+---
+
+## 22. NEXT STEPS
 
 - [ ] Wrap `assess()` into a FastAPI endpoint (`POST /analyze`)
 - [ ] Add Redis caching layer for frequent queries (~60-80% hit rate target)
