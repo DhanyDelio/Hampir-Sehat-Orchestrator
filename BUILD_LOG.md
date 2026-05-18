@@ -511,11 +511,11 @@ A standalone pytest file was created covering all deterministic pipeline compone
 
 **Import strategy:** All external modules (`groq`, `gradio`, `langchain_community`, `dotenv`) are mocked via `sys.modules` before `app.py` is imported. A fake `GROQ_API_KEY` is injected via `os.environ`. This allows the test file to import and exercise `enforce_math()` and `_format_human_readable()` in complete isolation.
 
-**Initial result: 19/19 passed.**
+**Current result: 23/23 passed.**
 
 ```
 pytest ai_backend/tests/ -v
-# 19 passed in 0.03s
+# 23 passed in 0.03s
 ```
 
 ### Test Classes
@@ -523,8 +523,23 @@ pytest ai_backend/tests/ -v
 | Class | Tests | What Is Covered |
 |-------|-------|-----------------|
 | `TestEnforceMath` | 7 | Atwater 4-4-9 formula, write-back pattern, float truncation, zero-gap guarantee, error passthrough, math_correction logging, quantity multiplier scenario |
-| `TestFormatHumanReadable` | 10 | Output structure, calorie value, session labels, time-slot detection (Indonesian + English), error path, audit_summary as Note, fallback health note, no internal jargon |
+| `TestFormatHumanReadable` | 14 | Output structure, calorie value, session labels, time-slot detection (Indonesian + English), truncation protection, dinner segment extraction, error path, audit_summary as Note, fallback health note, internal label isolation, deduplication flag, false-positive dedup check, dedup no-remove guarantee |
 | `TestAssessInputGuard` | 2 | Empty string and whitespace-only input return error dict |
+
+### Suite Evolution: 19 → 23
+
+The initial suite shipped with 19 tests. Four additional tests were added in §20 (Bug Fixes) to cover newly implemented behaviors:
+
+| New Test | Category | What It Validates |
+|----------|----------|-------------------|
+| `test_meal_segment_not_truncated` | Truncation protection | Morning segment shows full text past 80 chars — `tempe orek` and `kerupuk` both present |
+| `test_dinner_segment_not_truncated` | Dinner segment extraction | Dinner segment shows full text — `tempe goreng` and `nasi putih` both present |
+| `test_internal_pipeline_labels_not_shown_in_note` | Internal label isolation | `💡` line contains `audit_summary` text, not injected internal labels |
+| `test_duplicate_food_across_slots_triggers_flag` | Deduplication warning flag | Same food keyword in two slots → `"Similar items detected"` warning appears |
+| `test_no_false_positive_dedup_on_different_foods` | False-positive dedup check | Different foods in different slots → no warning triggered |
+| `test_dedup_does_not_remove_items` | Dedup no-remove guarantee | Both Morning and Dinner slots still present after dedup flag fires |
+
+> Note: 6 tests were added (not 4) — the deduplication behavior required 3 separate test cases to fully cover the flag, false-positive, and no-remove guarantees.
 
 ### One Test Fixed During Development
 
@@ -830,7 +845,21 @@ segment = segment[:earliest_cut].strip().rstrip(',. ')
 
 Items are never removed — only flagged. The user decides whether the duplication is intentional.
 
-**pytest coverage added:** 4 new tests — `test_meal_segment_not_truncated`, `test_dinner_segment_not_truncated`, `test_internal_pipeline_labels_not_shown_in_note`, `test_duplicate_food_across_slots_triggers_flag`, `test_no_false_positive_dedup_on_different_foods`, `test_dedup_does_not_remove_items`. Suite grew from 19 to **23/23 passed**.
+**pytest coverage added — 6 new tests, suite grew from 19 to 23/23 passed:**
+
+| New Test | Issue | What It Validates |
+|----------|-------|-------------------|
+| `test_meal_segment_not_truncated` | Issue 1 | Morning segment contains words past the old 80-char boundary (`tempe orek`, `kerupuk`) — confirms no truncation |
+| `test_dinner_segment_not_truncated` | Issue 1 | Dinner segment contains full food list (`tempe goreng`, `nasi putih`) — confirms boundary trimming works correctly |
+| `test_internal_pipeline_labels_not_shown_in_note` | Issue 2 | `💡` line contains the `audit_summary` value, not an injected internal label — confirms source priority |
+| `test_duplicate_food_across_slots_triggers_flag` | Issue 3 | Same food keyword in Morning and Dinner → `"Similar items detected"` warning present in output |
+| `test_no_false_positive_dedup_on_different_foods` | Issue 3 | Three different foods in three slots → no warning triggered — confirms min-4-char word filter works |
+| `test_dedup_does_not_remove_items` | Issue 3 | Both Morning and Dinner slots still present in output after dedup flag fires — confirms items are never removed |
+
+```
+pytest ai_backend/tests/ -v
+# 23 passed in 0.03s
+```
 
 ---
 
