@@ -906,9 +906,9 @@ def _format_human_readable(user_input: str, result: dict) -> str:
     if result.get("error"):
         reason = result.get("reason", result.get("error", "Unknown error"))
         return (
-            f"🚫 Input could not be processed.\n\n"
+            f"🚫 Hmm, we couldn't process that input.\n\n"
             f"Reason: {reason}\n\n"
-            f"Please enter a valid food name or meal description."
+            f"Try describing a food or meal — for example: \"nasi goreng telur\" or \"grilled chicken with rice\"."
         )
 
     # ── Extract fields ────────────────────────────────────────────────────
@@ -923,9 +923,9 @@ def _format_human_readable(user_input: str, result: dict) -> str:
 
     # ── Health note — plain language, no internal jargon ─────────────────
     if is_healthy:
-        health_note = "A reasonably healthy choice for this portion. Keep it balanced!"
+        health_note = "Looks like a balanced choice for this portion. Keep it up!"
     else:
-        health_note = "Watch the portion size — calorie or fat content is relatively high for one meal."
+        health_note = "This one's on the heavier side — worth keeping an eye on portion size."
 
     catatan = audit_sum if audit_sum else health_note
 
@@ -999,23 +999,25 @@ def _format_human_readable(user_input: str, result: dict) -> str:
 
     # ── Assemble clean output ─────────────────────────────────────────────
     output = (
-        f"📊 NUTRITION SUMMARY\n"
+        f"🥗 Nutrition Summary\n"
+        f"{'─' * 36}\n"
         f"\n"
-        f"📋 Detected Menu:\n"
-        f"  {item}\n"
+        f"📋 What you had:\n"
+        f"   {item}\n"
         f"\n"
-        f"🕒 Meal Time:\n"
+        f"🕒 Meal session:\n"
         f"{waktu_makan}\n"
         f"\n"
-        f"------------------------------------\n"
-        f"🔥 TOTAL NUTRITION:\n"
-        f"  • Calories     : {calories} kcal\n"
-        f"  • Protein      : {protein} g\n"
-        f"  • Carbohydrates: {carbs} g\n"
-        f"  • Fat          : {fat} g\n"
-        f"------------------------------------\n"
+        f"{'─' * 36}\n"
+        f"🔥 Total nutrition (estimated):\n"
         f"\n"
-        f"💡 Note: {catatan}"
+        f"   Calories      {calories} kcal\n"
+        f"   Protein       {protein} g\n"
+        f"   Carbohydrates {carbs} g\n"
+        f"   Fat           {fat} g\n"
+        f"\n"
+        f"{'─' * 36}\n"
+        f"💡 {catatan}"
     )
 
     return output
@@ -1044,26 +1046,28 @@ def gradio_assess(user_input: str) -> str:
 
 with gr.Blocks(title="HampirSehat — Nutrition Analyzer", theme=gr.themes.Soft()) as demo:
     gr.Markdown("""
-    # 🥗 HampirSehat — Smart Nutrition Analyzer
-    **Multi-Agent AI** · RAG Search · Math-Enforced · Indonesian & English
+    # 🥗 HampirSehat
+    ### Your personal nutrition analyzer — powered by multi-agent AI
 
-    Enter any food — single item, large portion, or a full day's meals (breakfast/lunch/dinner).
+    Describe what you ate in plain language. Indonesian, English, or mixed — it all works.
+    Single meal, large portion, or a full day's recap. Just type naturally.
     """)
 
     with gr.Row():
         with gr.Column(scale=1):
             input_box = gr.Textbox(
-                label       = "Food Description",
+                label       = "What did you eat?",
                 placeholder = (
-                    "Examples:\n"
-                    "• nasi goreng telur\n"
-                    "• porsi kuli nasi padang\n"
-                    "• breakfast nasi uduk, lunch ayam geprek, dinner soto ayam"
+                    "e.g.\n"
+                    "nasi goreng telur\n"
+                    "porsi kuli nasi padang\n"
+                    "breakfast nasi uduk, lunch ayam geprek, dinner soto ayam"
                 ),
                 lines       = 4,
                 max_lines   = 8,
             )
             gr.Examples(
+                label   = "Try these",
                 examples = [
                     ["nasi goreng telur"],
                     ["porsi kuli nasi padang"],
@@ -1074,13 +1078,14 @@ with gr.Blocks(title="HampirSehat — Nutrition Analyzer", theme=gr.themes.Soft(
                 ],
                 inputs = input_box,
             )
-            submit_btn = gr.Button("🔍 Analyze", variant="primary")
+            submit_btn = gr.Button("Analyze →", variant="primary", size="lg")
 
         with gr.Column(scale=1):
             output_box = gr.Textbox(
-                label    = "Nutrition Analysis Result",
-                lines    = 22,
-                max_lines= 30,
+                label     = "Your nutrition breakdown",
+                lines     = 22,
+                max_lines = 30,
+                show_copy_button = True,
             )
 
     submit_btn.click(fn=gradio_assess, inputs=input_box, outputs=output_box)
@@ -1088,13 +1093,8 @@ with gr.Blocks(title="HampirSehat — Nutrition Analyzer", theme=gr.themes.Soft(
 
     gr.Markdown("""
     ---
-    **REST API** (auto-generated by Gradio — for Flutter integration):
-    ```
-    POST /run/predict
-    Content-Type: application/json
-    {"data": ["your food description here"]}
-    ```
-    _Toggle to JSON output: un-comment the `return json.dumps(...)` line in `gradio_assess()`_
+    <small>Results are AI-estimated — not a substitute for professional dietary advice.
+    For Flutter/mobile integration, un-comment the JSON return line in `gradio_assess()`.</small>
     """)
 
 

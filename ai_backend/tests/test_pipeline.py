@@ -152,15 +152,14 @@ class TestFormatHumanReadable:
     def test_output_contains_required_sections(self):
         result = self._make_result()
         out = pipeline._format_human_readable("nasi goreng telur", result)
-        assert "NUTRITION SUMMARY"  in out
-        assert "Detected Menu"      in out
-        assert "Meal Time"          in out
-        assert "TOTAL NUTRITION"    in out
-        assert "Calories"           in out
-        assert "Protein"            in out
-        assert "Carbohydrates"      in out
-        assert "Fat"                in out
-        assert "Note"               in out
+        assert "Nutrition Summary"        in out
+        assert "What you had"             in out
+        assert "Meal session"             in out
+        assert "Total nutrition"          in out
+        assert "Calories"                 in out
+        assert "Protein"                  in out
+        assert "Carbohydrates"            in out
+        assert "Fat"                      in out
 
     def test_calorie_value_present_in_output(self):
         result = self._make_result(calories_kcal=487)
@@ -224,19 +223,19 @@ class TestFormatHumanReadable:
         """If audit_summary is empty, a plain health note is substituted"""
         result = self._make_result(audit_summary="", is_healthy=True)
         out = pipeline._format_human_readable("nasi goreng", result)
-        assert "Note:" in out
-        note_line = [l for l in out.splitlines() if "Note:" in l]
-        assert note_line
-        assert len(note_line[0].strip()) > len("💡 Note:")
+        # The 💡 line should contain a non-empty health note
+        note_line = [l for l in out.splitlines() if l.startswith("💡")]
+        assert note_line, "No 💡 line found in output"
+        assert len(note_line[0].strip()) > len("💡"), "Note line is empty"
 
     def test_internal_pipeline_labels_not_shown_in_note(self):
-        """Internal labels like 'Multi-meal aggregation applied' must never appear in Note."""
-        result = self._make_result(audit_summary="Multi-meal aggregation applied.")
+        """The function must not inject its own internal labels into the 💡 line."""
+        result = self._make_result(audit_summary="Standard portion, macro-consistent.")
         out = pipeline._format_human_readable("nasi goreng", result)
-        # audit_summary is passed through as-is — but the test verifies
-        # the function doesn't inject its own internal labels
-        # The Note should show whatever audit_summary says, not override it
-        assert "💡 Note:" in out
+        note_line = [l for l in out.splitlines() if l.startswith("💡")]
+        assert note_line
+        # The note line should contain the audit_summary text
+        assert "Standard portion" in note_line[0]
 
     # ── Issue 3: Deduplication flag ───────────────────────────────────────
 
