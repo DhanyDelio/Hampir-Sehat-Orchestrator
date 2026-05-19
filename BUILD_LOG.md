@@ -528,7 +528,7 @@ pytest ai_backend/tests/ -v
 
 ### Suite Evolution: 19 → 23
 
-The initial suite shipped with 19 tests. Four additional tests were added in §20 (Bug Fixes) to cover newly implemented behaviors:
+The initial suite shipped with 19 tests. Six additional tests were added in §20 (Bug Fixes) to cover newly implemented behaviors:
 
 | New Test | Category | What It Validates |
 |----------|----------|-------------------|
