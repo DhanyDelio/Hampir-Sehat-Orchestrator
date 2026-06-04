@@ -954,3 +954,174 @@ All layout, labels, placeholder text, examples, and markdown descriptions were l
 
 *This log is written as honest engineering documentation, not marketing material.*  
 *Every failure is recorded because failures are part of the process.*
+
+---
+
+## 24. ARCHITECTURE UPGRADE — Pydantic Structured Outputs (June 4, 2026)
+
+### Decision
+
+Migrated Lead Auditor output from manual `json.loads()` + regex parsing to **Pydantic Structured Outputs** via Groq's `response_format` parameter.
+
+### Problem with Previous Approach
+
+The old pipeline asked the LLM to produce a free-form JSON string, then parsed it with:
+
+```python
+raw = re.sub(r"```json|```", "", raw).strip()
+m   = re.search(r"\{.*\}", raw, re.DOTALL)
+result = json.loads(raw)   # could raise JSONDecodeError
+```
+
+This meant: any stray character, markdown fence, or truncated output → `JSONDecodeError` → user sees error in UI.
+
+### Solution: `FoodNutrientOutput` Pydantic Model
+
+```python
+class FoodNutrientOutput(BaseModel):
+    # REQUIRED — nutrition meter fields (Flutter mati tanpa ini)
+    identified_item : str
+    calories_kcal   : int
+    carbs_g         : int
+    protein_g       : int
+    fat_g           : int
+    # OPTIONAL — metadata fields (safe defaults if LLM drops them)
+    is_healthy          : Optional[bool] = None
+    macro_modifiers     : List[str]      = []
+    excluded_ingredients: List[str]      = []
+    audit_summary       : Optional[str]  = ""
+    status_voting       : Optional[str]  = ""
+    rag_source_used     : Optional[bool] = None
+    portion_adjusted    : Optional[bool] = None
+```
+
+`response_format={"type": "json_object", "schema": _FOOD_NUTRIENT_SCHEMA}` pins the LLM to this schema at the API level.
+
+### Degradation Ladder in `_call_auditor`
+
+```
+A. response_format + model_validate_json()     ← ideal path
+   ↓ ValidationError (LLM drops optional field)
+B. Parse raw JSON manually + setdefault() fills missing optional fields
+   Required fields missing → raise to outer handler
+   ↓ response_format not supported by model
+C. Plain API call + manual json.loads()        ← CB fallback model path
+```
+
+### Token Savings
+
+- Removed `OUTPUT_SCHEMA` string (~234 tokens) from every Lead Auditor prompt
+- `max_tokens` reduced 450 → 350 (no schema description text needed)
+- Estimated saving: ~247 tokens per request (~$0.15 per 1000 requests)
+
+### Schema Design: Flat Macros
+
+`FoodNutrientOutput` uses **flat fields** (`carbs_g`, `protein_g`, `fat_g`) instead of nested `{"macros": {...}}`. This matches Flutter's direct field access pattern. `enforce_math()` and `_format_human_readable()` support both flat (new) and nested (legacy) for backward compatibility.
+
+---
+
+## 25. FEATURE — Universal Modifier System (June 4, 2026)
+
+### Problem
+
+The original modifier system only recognized 5 hardcoded categories (`no_sugar`, `no_milk`, `low_fat`, `reduced_portion`, `no_ice`). Input like `"bubur ayam ga pake kacang"` or `"gado-gado tanpa telur"` was ignored entirely.
+
+### Solution: Two-Layer Detection
+
+**Layer 1 — `MACRO_MODIFIERS`** (named modifiers with calorie impact):
+- 5 categories remain, each with bilingual keyword lists
+- Triggers hard macro adjustments in all agents + Lead Auditor
+
+**Layer 2 — `parse_negations()`** (universal ingredient exclusion):
+```python
+NEGATION_PREFIXES = ["tanpa ", "ga pake ", "no ", "without ", "pisah ", ...]
+
+def parse_negations(raw_input: str) -> dict:
+    # Returns: {"macro_modifiers": [...], "excluded_ingredients": [...]}
+```
+Pattern: `[NEGATION_PREFIX] + [ingredient word(s)]` → extracted to `excluded_ingredients`.
+
+**Double safety net:** Front Office (Compound) extracts both layers in its JSON output. Python `parse_negations()` runs independently and results are **merged** — if LLM misses something, Python catches it.
+
+**Test cases passing:**
+```
+"bubur ayam ga pake kacang"           → excluded: [kacang]
+"gado-gado tanpa telur tanpa kerupuk" → excluded: [telur, kerupuk]
+"soto betawi no santan"               → excluded: [santan]
+"nasi padang tanpa rendang"           → excluded: [rendang]
+"kopi susu tanpa gula tanpa es"       → modifiers: [no_sugar, no_ice]
+```
+
+---
+
+## 26. BUGFIX — Modifier Over-Correction / Nutrition Under-Estimation (June 4, 2026)
+
+### Incident
+
+**Input:** `"susu coklat tanpa gula"`  
+**AI output:** `carbs_g=4, calories_kcal=55`  
+**Actual value:** `carbs_g=9-12g, calories_kcal=80-110`  
+**Error:** -73% carbs, -50% calories
+
+### Root Cause
+
+All 3 agents and Lead Auditor GUARDRAIL 0 contained the rule:
+
+```
+"no_sugar" milk-based drink: carbs_g = 3-4g (lactose only)
+```
+
+This was wrong. The 3-4g figure came from kopi susu (coffee + milk), not pure dairy. `susu coklat` (chocolate milk) has 9-12g lactose per 200ml — all naturally occurring, none from added sugar.
+
+The fundamental error: **modifiers only remove ADDED ingredients, not naturally occurring nutrients**.
+
+### Fix: `NUTRITION_FLOOR_RULES` Constant
+
+A single string constant injected into **4 places simultaneously** (T1, T2, T3, Lead Auditor GUARDRAIL 0):
+
+```
+DAIRY    → "tanpa gula" removes added sugar ONLY. Lactose stays: min 9-12g/200ml
+CARB     → Any modifier cannot reduce carbs by more than 40%
+PROTEIN  → Cooking method never removes protein
+BEVERAGE → Natural fructose in juice is NOT added sugar — stays
+UNIVERSAL → Floor: dairy ≥50kcal, rice-based ≥150kcal, protein ≥100kcal per serving
+```
+
+### Fix: `enforce_math()` Bidirectional Correction
+
+Old: only applied a hard-cap (carbs_g > N → clamp to N)  
+New: applies **floor AND cap** based on beverage type:
+
+| Beverage Type | Floor | Cap |
+|---|---|---|
+| Dairy (susu, latte, yogurt) | 9g | 15g |
+| Fruit (jus, smoothie) | 8g | 18g |
+| Plain (black coffee, plain tea) | 0g | 2g |
+
+T3 Logic Auditor compliance rules also updated to be dairy-aware:
+- Old: `carbs_g >= 10 for any no_sugar beverage is WRONG`
+- New: dairy no_sugar = 9-12g is **correct**. Under 5g for dairy = under-estimate flag.
+
+### Verification
+
+```
+susu coklat tanpa gula (carbs was 4g) → floor raised to 9g ✅
+kopi susu tanpa gula (carbs was 20g)  → cap applied to 15g ✅
+jus jeruk tanpa gula (carbs was 2g)   → fruit floor raised to 8g ✅
+kopi hitam tanpa gula (carbs was 15g) → plain cap applied to 2g ✅
+zero-gap guarantee: still holds after floor/cap correction ✅
+```
+
+---
+
+## 27. NEXT STEPS (Updated)
+
+- [x] Pydantic structured outputs with graceful ValidationError degradation
+- [x] Universal negation parser for arbitrary ingredient exclusions
+- [x] Nutrition floor rules preventing modifier over-correction
+- [ ] FastAPI endpoint wrapper (`POST /analyze`) for Flutter integration
+- [ ] Redis caching layer for frequent queries (~60-80% hit rate target)
+- [ ] DynamoDB persistence to build proprietary nutrition dataset
+- [ ] Flutter mobile app (Samsung Galaxy Store target)
+- [ ] Whisper STT → `assess()` pipeline for voice input
+- [ ] Warm-up ping endpoint to prevent HF Spaces cold start UX degradation

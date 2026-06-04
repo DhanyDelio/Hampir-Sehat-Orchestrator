@@ -19,6 +19,8 @@ import gradio as gr
 from groq import Groq
 from dotenv import load_dotenv
 from langchain_community.tools import DuckDuckGoSearchRun
+from pydantic import BaseModel, Field
+from typing import List, Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONFIGURATION
@@ -42,6 +44,101 @@ searcher = DuckDuckGoSearchRun()
 CIRCUIT_BREAKER_FALLBACK = "llama-3.1-8b-instant"
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  PYDANTIC STRUCTURED OUTPUT SCHEMA
+#  Used by Lead Auditor via response_format — replaces manual OUTPUT_SCHEMA str.
+#  Benefits: no regex parsing, no json.loads() failure risk, ~80 fewer output
+#  tokens per request (no schema description text), guaranteed field types.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FoodNutrientOutput(BaseModel):
+    """
+    Structured output schema for HampirSehat nutrition assessment.
+    Enforced at the API level via Groq response_format — the LLM is
+    constrained to produce exactly this shape, no prose, no markdown fences.
+    Macros are flat fields (not nested) for direct Flutter consumption.
+
+    Field tiers:
+    - REQUIRED (nutrition meter): calories_kcal, carbs_g, protein_g, fat_g, identified_item
+    - OPTIONAL (metadata): all other fields — safe to drop without crashing Flutter
+    """
+    # ── REQUIRED — nutrition meter fields, Flutter mati tanpa ini ────────────
+    identified_item     : str            = Field(description="Corrected food name in user's language")
+    calories_kcal       : int            = Field(description="Adjusted calories — overridden by enforce_math()")
+    carbs_g             : int            = Field(description="Carbohydrates in grams (0-4 if no_sugar beverage)")
+    protein_g           : int            = Field(description="Protein in grams")
+    fat_g               : int            = Field(description="Fat in grams")
+
+    # ── OPTIONAL — metadata fields, default ke safe value kalau LLM drop ─────
+    is_healthy          : Optional[bool] = None
+    macro_modifiers     : List[str]      = Field(default_factory=list, description="Applied macro modifiers e.g. ['no_sugar']")
+    excluded_ingredients: List[str]      = Field(default_factory=list, description="Excluded ingredients e.g. ['kacang']")
+    audit_summary       : Optional[str]  = ""
+    status_voting       : Optional[str]  = ""
+    rag_source_used     : Optional[bool] = None
+    portion_adjusted    : Optional[bool] = None
+
+
+# Pre-compute once at startup — reused on every Lead Auditor call, zero overhead
+_FOOD_NUTRIENT_SCHEMA = FoodNutrientOutput.model_json_schema()
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NUTRITION FLOOR RULES
+#  Injected into ALL agent system prompts and Lead Auditor GUARDRAIL 0.
+#  Purpose: prevent over-aggressive modifier application that zeros out
+#  naturally occurring nutrients (lactose, complex carbs, natural protein).
+#  Root cause fix: modifiers only affect ADDED ingredients, NOT natural ones.
+# ─────────────────────────────────────────────────────────────────────────────
+
+NUTRITION_FLOOR_RULES = """
+=== UNIVERSAL NUTRITION FLOOR RULES — APPLY BEFORE ANY MODIFIER ===
+
+CRITICAL DISTINCTION: Modifiers (no_sugar, low_fat, etc.) ONLY remove ADDED ingredients.
+They NEVER remove naturally occurring nutrients from the base food.
+
+── DAIRY FLOORS (susu, yogurt, keju, kefir) ──────────────────────────────────
+  "tanpa gula" / "no sugar" on dairy:
+  → Remove ONLY added sugar (tebu, sirup, gula pasir)
+  → KEEP lactose (gula alami susu): min 9-12g carbs per 200ml liquid milk
+  → KEEP milk fat: min 5-8g fat per 200ml whole milk, min 2-4g low-fat milk
+  → KEEP milk protein: min 6-8g protein per 200ml
+  → Susu coklat tanpa gula: karbo 9-12g (laktosa), fat 5-8g, protein 6-8g
+    → kalori floor: 80-120 kcal per 200ml. NOT 4g carbs. NOT 55 kcal.
+  "rendah lemak" / "low fat" on dairy:
+  → Fat reduced to 2-4g per 200ml — NOT zero
+  → Lactose and protein unchanged
+
+── CARB-BASED FOOD FLOORS (nasi, roti, mie, kentang, bubur) ─────────────────
+  ANY modifier CANNOT reduce carbs by more than 40% from baseline.
+  → "diet nasi" = smaller portion, NOT karbo = 0
+  → "nasi merah tanpa lauk" = ~40-55g carbs still present in the rice
+  → Minimum karbo floor: 50% of standard serving carbs, regardless of modifier
+  → Minimum kalori floor: 150 kcal per standard rice/bread/noodle serving
+
+── PROTEIN FOOD FLOORS (ayam, ikan, telur, tahu, tempe, daging) ─────────────
+  "tanpa minyak" / "rebus" / "kukus" / "panggang":
+  → Fat reduced 50-70% from fried baseline — NOT zero (natural fat remains)
+  → PROTEIN STAYS 100% — cooking method NEVER removes protein
+  → Telur rebus: protein 6-7g stays. Fat drops from 5g (goreng) to 3g (rebus)
+  → Minimum kalori floor: 100 kcal per standard protein serving
+
+── BEVERAGE FLOORS (teh, kopi, jus, minuman berbahan buah) ──────────────────
+  "tanpa gula" on fruit juice / natural beverages:
+  → Remove added sugar ONLY
+  → KEEP natural sugars from fruit (fruktosa): jus jeruk = 8-10g natural sugar
+  → Jus tanpa gula tambahan ≠ 0g carbs — fruit sugar is natural, stays
+  "tanpa gula" on black coffee / plain tea (no milk, no fruit):
+  → carbs = 0-1g (acceptable — nothing natural left to count)
+
+── GENERAL ANTI-OVER-CORRECTION RULE ────────────────────────────────────────
+  Target accuracy: ±30% of actual nutritional value.
+  If your estimate would result in:
+  - A dairy-based drink under 50 kcal per 200ml → YOU ARE WRONG, recalculate
+  - A rice-based meal under 150 kcal → YOU ARE WRONG, recalculate
+  - A protein serving under 100 kcal → YOU ARE WRONG, recalculate
+  Modifiers shift the COMPOSITION of macros, not eliminate food entirely.
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  AGENT REGISTRY — Critical RAG
 #  Each agent receives the RAG baseline and MUST argue:
 #  [Internet Data] vs [User Context] = [Final Argument]
@@ -63,7 +160,22 @@ AGENTS = {
             "not the generic internet standard. "
             "If user describes a large portion (e.g., porsi kuli, double serving, extra large), "
             "you MUST adjust your health assessment accordingly. "
-            "\n\nArgument format: [Internet Baseline] vs [User Context] = [Health Assessment] "
+
+            "\n\n=== CRITICAL RULES FOR MODIFIERS — NON-NEGOTIABLE ==="
+            "\nThe cleaned memo contains a 'modifiers' field. You MUST obey it strictly:"
+            "\n- 'no_sugar' modifier detected: The beverage/food has NO added sugar."
+            "  Carbohydrates from sugar = 0g. Only residual natural carbs remain "
+            "  (e.g., 3-4g lactose if milk-based, 0g if no milk). "
+            "  DO NOT use standard sugar values from internet data. "
+            "  Calories MUST be reduced accordingly."
+            "\n- 'no_milk' modifier: Remove all dairy fat and protein from calculation."
+            "\n- 'low_fat' modifier: Fat must be at least 50% lower than standard."
+            "\n- 'reduced_portion' modifier: Scale all macros down — DO NOT use full portion."
+            "\nIf modifiers list is NOT empty, internet baseline is INVALID for those nutrients. "
+            "You MUST override it with the modifier-adjusted values."
+
+            f"\n\n{NUTRITION_FLOOR_RULES}"
+
             "\n\nRespond in MAXIMUM 3 sentences. "
             "ONLY discuss food, nutrition, and health. "
             "If input is unrelated, respond exactly: [OUT_OF_SCOPE]"
@@ -73,7 +185,7 @@ AGENTS = {
         "label" : "Nutrition Engine",
         "tier"  : 2,
         "emoji" : "📊",
-        "focus" : "macro interpolation — adjust internet numbers to user real portion",
+        "focus" : "macro interpolation — adjust internet numbers to user real portion AND modifiers",
         "models": [
             "meta-llama/llama-4-scout-17b-16e-instruct",
             "llama-3.3-70b-versatile",
@@ -84,19 +196,34 @@ AGENTS = {
             "You receive: (1) a RAG baseline with standard macro numbers, (2) the user actual input. "
             "\n\nCRITICAL THINKING MANDATE — MACRO INTERPOLATION: "
             "Internet data gives standard serving sizes. "
-            "Your job is to ADJUST those numbers to match the user ACTUAL described portion. "
-            "\n\nPORTION SCALING RULES — READ CAREFULLY:"
+            "Your job is to ADJUST those numbers to match the user ACTUAL described portion AND modifiers. "
+
+            "\n\n=== CRITICAL RULES FOR MODIFIERS — HIGHEST PRIORITY, OVERRIDE EVERYTHING ==="
+            "\nModifiers are explicit user instructions. They take priority over ALL internet data."
+            "\n\nMODIFIER: 'no_sugar' — MANDATORY RULES:"
+            "\n  1. Set sugar-derived carbs to 0g. No exceptions."
+            "\n  2. If the drink is milk-based (susu, latte, kopi susu): residual carbs = 3-4g (lactose only)."
+            "\n  3. If the drink has NO milk (black coffee, teh tawar): carbs = 0-1g total."
+            "\n  4. Calories MUST drop drastically from the standard value."
+            "\n     Example: Kopi susu standard = ~120 kcal (20g carbs from sugar)."
+            "\n     Kopi susu tanpa gula = ~40-50 kcal (3g lactose carbs + milk fat/protein only)."
+            "\n  5. DO NOT output carbs_g >= 10 for a 'no_sugar' beverage. That is WRONG."
+            "\n\nMODIFIER: 'no_milk' — set dairy fat and protein to 0."
+            "\nMODIFIER: 'low_fat' — fat must be minimum 50% lower than standard serving."
+            "\nMODIFIER: 'reduced_portion' — multiply all macros by 0.5."
+            "\n\nIf modifiers list is NOT empty, RAG baseline carb/calorie numbers are INVALID."
+            "\nYou MUST compute adjusted macros from first principles, not from internet data."
+
+            f"\n\n{NUTRITION_FLOOR_RULES}"
+
+            "\n\nPORTION SCALING RULES:"
             "\n- If portion_descriptor is 'normal': scale internet data to 1 standard serving "
             "  (~250-300g cooked rice, ~400-500 kcal for a typical Indonesian rice dish). "
-            "  Do NOT inflate numbers beyond this range without explicit justification."
-            "\n- If internet data is per 55g or per 100g, scale UP proportionally to ~250-300g. "
-            "  Example: 230 kcal per 55g -> 230 * (275/55) = ~1150 kcal is WRONG for normal portion. "
-            "  Use common sense: a normal plate of nasi goreng is ~400-600 kcal, not 1000+."
             "\n- If portion_descriptor is 'large' or 'extra_large': scale up by 1.5x-2x from normal."
             "\n- PROTEIN CAP: For rice-based dishes without explicit extra meat, "
-            "  protein should NOT exceed 25g for normal portion. "
-            "  Nasi goreng telur (egg fried rice) normal: ~15-20g protein."
-            "\n\nArgument format: [Internet: X kcal/Yg] -> [Scaled to normal portion: Z kcal] "
+            "  protein should NOT exceed 25g for normal portion."
+
+            "\n\nArgument format: [Internet: X kcal/Yg] -> [Modifier-adjusted: Z kcal] "
             "\n\nProvide specific adjusted numbers: calories, carbs, protein, fat. "
             "Respond in MAXIMUM 3 sentences. "
             "ONLY discuss food and nutrition. "
@@ -107,7 +234,7 @@ AGENTS = {
         "label" : "Logic Auditor",
         "tier"  : 3,
         "emoji" : "🔍",
-        "focus" : "skeptical validation — expose inconsistencies between internet claims and user reality",
+        "focus" : "skeptical validation — expose inconsistencies, enforce modifier compliance",
         "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", CIRCUIT_BREAKER_FALLBACK],
         "system": (
             "You are the Logic Auditor, Tier 3 agent in the HampirSehat Critical RAG pipeline. "
@@ -115,16 +242,31 @@ AGENTS = {
             "\n\nCRITICAL THINKING MANDATE — SKEPTICAL VALIDATION: "
             "You are the NUMBER ONE skeptic. Find inconsistencies between: "
             "- What the internet claims (e.g., healthy, low calorie) "
-            "- What the user actually described (cooking method, portion, added ingredients) "
-            "\n\nPORTION REALITY CHECK — IMPORTANT:"
+            "- What the user actually described (cooking method, portion, modifiers) "
+
+            "\n\n=== MODIFIER COMPLIANCE AUDIT — YOUR PRIMARY JOB ==="
+            "\nIf 'modifiers' field contains 'no_sugar':"
+            "\n  - For NON-DAIRY beverages (black coffee, teh, juice without milk):"
+            "\n    carbs_g > 5 is WRONG — flag it."
+            "\n  - For DAIRY beverages (susu, kopi susu, latte, yogurt drink):"
+            "\n    carbs_g should be 9-12g (lactose). carbs_g < 5 is under-estimate — flag it."
+            "\n    carbs_g > 15 is over-estimate (added sugar not removed) — flag it."
+            "\n  - Flag BOTH over AND under-estimates explicitly."
+            "\nIf 'modifiers' field contains 'low_fat':"
+            "\n  - Flag any fat_g that is not reduced from standard by at least 50%."
+            "\n  - But fat_g = 0 for dairy is also WRONG (natural fat remains)."
+            "\nIf modifiers list is empty: proceed with standard portion logic."
+
+            f"\n\n{NUTRITION_FLOOR_RULES}"
+
+            "\n\nPORTION REALITY CHECK:"
             "\n- If the user did NOT explicitly mention a large portion, "
             "  flag any agent that inflated numbers beyond normal range as INCORRECT."
             "\n- Normal nasi goreng telur (1 plate): ~400-550 kcal, ~15-20g protein, ~60-75g carbs."
-            "\n- If another agent claims >600 kcal or >25g protein for a standard input, "
-            "  call it out explicitly: 'Inflated estimate — no large portion keyword detected.'"
             "\n- Only validate large portions if user explicitly said: "
             "  porsi kuli, double, extra large, banyak banget, jumbo, 2x, 3x."
-            "\n\nArgument format: [Internet Claim] vs [User Reality] = [Logical Verdict] "
+
+            "\n\nArgument format: [Internet Claim] vs [User Reality + Modifiers] = [Logical Verdict] "
             "\n\nBe direct, precise, unafraid to contradict inflated estimates. "
             "Respond in MAXIMUM 3 sentences. "
             "ONLY discuss food and nutrition. "
@@ -143,6 +285,33 @@ LEAD_AUDITOR = {
     "fallback_model": "llama-3.1-8b-instant",       # Fallback if primary hits 429
     "emoji"         : "🎯",
     "system": (
+        # GUARDRAIL 0: Modifier Enforcement — checked BEFORE everything else
+        "=== GUARDRAIL 0: MODIFIER ENFORCEMENT — HIGHEST PRIORITY ==="
+        "\nThe cleaned memo contains a 'modifiers' field. This is the user's EXPLICIT instruction."
+        "\nYou MUST apply modifiers BEFORE setting any macro values."
+
+        f"\n\n{NUTRITION_FLOOR_RULES}"
+
+        "\n\nMODIFIER: 'no_sugar' — MANDATORY:"
+        "\n  - Remove ADDED sugar ONLY. Naturally occurring nutrients STAY."
+        "\n  - If drink is milk-based (susu, latte, kopi susu, matcha latte, yogurt, etc.):"
+        "\n    carbs_g = 9-12g (lactose, NOT 3-4g). fat_g and protein_g from milk remain."
+        "\n    calories_kcal floor = 80-120 kcal per 200ml. NOT 40-55 kcal."
+        "\n  - If drink has NO milk AND NO fruit (black coffee, teh tawar, black tea):"
+        "\n    carbs_g = 0-1g total. calories_kcal = derived from fat + protein only."
+        "\n  - If drink has FRUIT (jus jeruk, jus mangga, smoothie):"
+        "\n    Natural fructose STAYS: carbs_g = 8-15g depending on fruit."
+        "\n  - FORBIDDEN: carbs_g < 5 for any dairy-based 'no_sugar' beverage."
+        "\n    If you output carbs_g < 5 for milk-based no_sugar → AUDIT FAILED."
+        "\nMODIFIER: 'no_milk' — set dairy fat and protein to 0g."
+        "\nMODIFIER: 'low_fat' — fat_g reduced 50-70% from standard, NOT to zero."
+        "\nMODIFIER: 'reduced_portion' — multiply ALL macros by 0.5 after computing base."
+        "\n\nIF MODIFIERS LIST IS NOT EMPTY:"
+        "\n  RAG internet data for affected nutrients is INVALID."
+        "\n  Compute macros from first principles respecting modifier + floor rules above."
+        "\n  State in audit_summary: 'Modifier [{modifier}] applied — nutrients adjusted.'"
+        "\n\n"
+
         # Identity — OCR/typo already handled by Front Office (Compound)
         "You are the Lead Auditor, the final decision-maker in the HampirSehat nutrition pipeline. "
         "You are a senior nutrition specialist, not a medical doctor. "
@@ -240,20 +409,9 @@ LEAD_AUDITOR = {
 #  OUTPUT SCHEMA  (reference for Lead Auditor)
 # ─────────────────────────────────────────────────────────────────────────────
 
-OUTPUT_SCHEMA = """{
-  "identified_item"  : "string — corrected food name, in user language",
-  "is_healthy"       : "boolean — true if healthy given user actual portion",
-  "calories_kcal"    : "integer — ADJUSTED calories based on user real portion",
-  "macros"           : {
-    "carbs_g"    : "integer — adjusted carbohydrates in grams",
-    "protein_g"  : "integer — adjusted protein in grams",
-    "fat_g"      : "integer — adjusted fat in grams"
-  },
-  "audit_summary"    : "string — max 20 words explaining WHY these numbers, in user language",
-  "status_voting"    : "string — which agent argument was prioritized and why",
-  "rag_source_used"  : "boolean — true if internet search data was used as baseline",
-  "portion_adjusted" : "boolean — true if numbers were adjusted from internet standard"
-}"""
+# OUTPUT_SCHEMA replaced by FoodNutrientOutput Pydantic model above.
+# Lead Auditor now uses response_format={"type":"json_object","schema":_FOOD_NUTRIENT_SCHEMA}
+# which eliminates schema description tokens from the prompt entirely.
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  FRONT OFFICE CONFIG
@@ -300,6 +458,27 @@ FRONT_OFFICE = {
         "   porsi kuli, double, extra large, banyak banget, jumbo, 2x, 3x."
         "   Set quantity_multiplier = numeric value if user states a count "
         "   (e.g., 2 gelas -> 2.0, setengah porsi -> 0.5, 5 biji -> 5.0, default 1.0)."
+        "\n5. MODIFIER EXTRACTION — CRITICAL, DO NOT SKIP:"
+        "   Scan the ENTIRE input for ingredient/preparation modifiers. "
+        "   Extract ALL that apply as a list in 'modifiers'. "
+        "   These modifiers MUST be propagated verbatim to all downstream agents. "
+        "   Examples:"
+        "   'tanpa gula' / 'no sugar' / 'sugar free' -> modifiers: ['no_sugar']"
+        "   'tanpa susu' / 'no milk'                 -> modifiers: ['no_milk']"
+        "   'kurang minyak' / 'less oil'              -> modifiers: ['low_fat']"
+        "   'tanpa es' / 'no ice'                     -> modifiers: ['no_ice']"
+        "   Multiple modifiers are allowed: ['no_sugar', 'no_ice']"
+        "   If no modifier detected, set modifiers: []"
+        "\n6. EXCLUDED INGREDIENTS — CRITICAL:"
+        "   Scan for ANY ingredient the user explicitly excluded using negation words "
+        "   (tanpa, ga pake, no, without, minus, kurangi, pisah, etc.)."
+        "   Capture the excluded ingredient name(s) in 'excluded_ingredients' as a list."
+        "   Examples:"
+        "   'bubur ayam ga pake kacang'    -> excluded_ingredients: ['kacang']"
+        "   'gado-gado tanpa telur'        -> excluded_ingredients: ['telur']"
+        "   'soto tanpa jeroan pisah nasi' -> excluded_ingredients: ['jeroan', 'nasi']"
+        "   'nasi goreng no egg no onion'  -> excluded_ingredients: ['egg', 'onion']"
+        "   If no ingredient excluded, set excluded_ingredients: []"
         "\n\nOutput ONLY this JSON — no preamble, no explanation:"
         "\n{"
         '\n  "cleaned_input": "corrected food name and description",'
@@ -307,6 +486,8 @@ FRONT_OFFICE = {
         '\n  "portion_descriptor": "normal | large | extra_large | small",'
         '\n  "quantity_multiplier": 1.0,'
         '\n  "cooking_method": "fried | grilled | steamed | unknown",'
+        '\n  "modifiers": [],'
+        '\n  "excluded_ingredients": [],'
         '\n  "is_food_related": true,'
         '\n  "is_safe": true,'
         '\n  "rejection_reason": null'
@@ -320,6 +501,133 @@ HARMFUL_KEYWORDS = [
     "bahan peledak", "explosive", "senjata", "weapon",
     "narkoba", "drugs", "rat poison", "insecticide",
 ]
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  UNIVERSAL NEGATION PARSER
+#  Handles arbitrary ingredient exclusions: "tanpa kacang", "ga pake sambal",
+#  "no egg", "without onion", etc. — not just predefined categories.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Negation prefixes that signal exclusion of the NEXT token(s).
+# Pattern matched: [NEGATION_PREFIX] [ingredient word(s)]
+NEGATION_PREFIXES = [
+    # Indonesian formal
+    "tanpa ", "tidak pake ", "tidak pakai ", "tanpa pake ", "tanpa pakai ",
+    # Indonesian colloquial
+    "nggak pake ", "nggak pakai ", "ga pake ", "ga pakai ",
+    "gak pake ", "gak pakai ", "kagak pake ",
+    # English
+    "no ", "without ", "minus ", "skip ",
+    # Reduction (partial exclusion)
+    "kurangi ", "kurang ", "less ", "sedikit ",
+    # Separation (common for rice dishes: "pisah sambal")
+    "pisah ", "pisahin ", "dipisah ",
+]
+
+# ── Macro-impacting modifiers ─────────────────────────────────────────────
+# These are tracked SEPARATELY because they affect calorie/carb/fat maths,
+# not just ingredient listing. The system enforces hard constraints for these.
+# Everything else detected by NEGATION_PREFIXES = ingredient-level exclusion.
+MACRO_MODIFIERS = {
+    "no_sugar": [
+        "tanpa gula", "no sugar", "sugar free", "sugar-free",
+        "unsweetened", "tanpa pemanis", "less sugar", "kurang gula",
+        "gula dikit", "gak pake gula", "nggak pake gula",
+        "without sugar", "0 sugar", "zero sugar",
+    ],
+    "no_milk": [
+        "tanpa susu", "no milk", "non-dairy", "dairy free",
+        "without milk", "nggak pake susu", "ga pake susu",
+    ],
+    "low_fat": [
+        "rendah lemak", "low fat", "less oil", "kurang minyak",
+        "tanpa minyak", "no oil",
+    ],
+    "reduced_portion": [
+        "setengah", "half", "porsi kecil", "small portion",
+    ],
+    "no_ice": [
+        "tanpa es", "no ice", "hot", "panas", "hangat",
+    ],
+}
+
+# Alias for backward compatibility with enforce_math() Python hard-cap
+MODIFIER_KEYWORDS = MACRO_MODIFIERS
+
+
+def parse_negations(raw_input: str) -> dict:
+    """
+    Universal negation parser — scans raw user input for any ingredient exclusion.
+
+    Detects two layers:
+    1. macro_modifiers : list[str] — named modifiers with calorie impact
+       (no_sugar, no_milk, low_fat, reduced_portion, no_ice)
+    2. excluded_ingredients : list[str] — arbitrary excluded items
+       (kacang, sambal, telur, kerupuk, onion, etc.)
+
+    Both layers are returned in a dict and passed to all agents + Lead Auditor.
+
+    Examples
+    --------
+    "bubur ayam ga pake kacang"
+        -> macro_modifiers=[], excluded_ingredients=["kacang"]
+
+    "kopi susu tanpa gula tanpa es"
+        -> macro_modifiers=["no_sugar", "no_ice"], excluded_ingredients=["gula", "es"]
+
+    "nasi goreng tanpa telur kurang minyak"
+        -> macro_modifiers=["low_fat"], excluded_ingredients=["telur", "minyak"]
+    """
+    text_lower = raw_input.lower()
+
+    # ── Layer 1: Named macro modifiers ───────────────────────────────────
+    detected_macro = []
+    for mod_key, keywords in MACRO_MODIFIERS.items():
+        if any(kw in text_lower for kw in keywords):
+            detected_macro.append(mod_key)
+
+    # ── Layer 2: Universal ingredient exclusions via negation prefix ──────
+    excluded = []
+    for prefix in NEGATION_PREFIXES:
+        idx = 0
+        while True:
+            pos = text_lower.find(prefix, idx)
+            if pos == -1:
+                break
+            # Extract the word(s) following the prefix (up to 3 words or punctuation)
+            after = raw_input[pos + len(prefix):].strip()
+            tokens = re.split(r"[\s,\.;]+", after)
+            # Take up to 2 tokens as the excluded ingredient name
+            ingredient_tokens = []
+            for tok in tokens[:2]:
+                tok_clean = tok.strip().lower()
+                # Stop at next negation or conjunction
+                if tok_clean in ("dan", "and", "atau", "or", "dengan", "sama", "juga"):
+                    break
+                if tok_clean:
+                    ingredient_tokens.append(tok_clean)
+                    # Only take 1 token unless it looks like a compound (e.g. "kacang tanah")
+                    if len(ingredient_tokens) == 1 and len(tokens) > 1:
+                        next_tok = tokens[1].strip().lower() if len(tokens) > 1 else ""
+                        # Continue only if next token is NOT a new negation prefix
+                        is_next_negation = any(
+                            next_tok.startswith(p.strip()) for p in NEGATION_PREFIXES
+                        )
+                        if not is_next_negation and next_tok not in (
+                            "dan", "and", "atau", "or", "dengan", "sama"
+                        ):
+                            ingredient_tokens.append(next_tok)
+                    break
+
+            ingredient = " ".join(ingredient_tokens).strip()
+            if ingredient and ingredient not in excluded:
+                excluded.append(ingredient)
+            idx = pos + 1
+
+    return {
+        "macro_modifiers"      : detected_macro,
+        "excluded_ingredients" : excluded,
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STAGE 0 — RAG SEARCH
@@ -455,10 +763,29 @@ def front_office_clean(raw_input: str) -> dict:
         raw      = m.group(0) if m else raw
         result   = json.loads(raw)
 
+        # ── Python negation parser as safety net ──────────────────────────
+        # Even if Compound returns valid JSON, run parse_negations() to catch
+        # any exclusions the LLM might have missed. Merge both results.
+        parsed = parse_negations(raw_input)
+
+        # Merge macro_modifiers: union of LLM output + Python detection
+        llm_modifiers = result.get("modifiers") or []
+        merged_modifiers = list(set(llm_modifiers) | set(parsed["macro_modifiers"]))
+        result["modifiers"] = merged_modifiers
+
+        # Merge excluded_ingredients: union of LLM output + Python detection
+        llm_excluded = result.get("excluded_ingredients") or []
+        merged_excluded = list(set(llm_excluded) | set(parsed["excluded_ingredients"]))
+        result["excluded_ingredients"] = merged_excluded
+
         print(f"   ✅ Cleaned: '{result.get('cleaned_input', raw_input)}'")
         print(f"   └─ food={result.get('food_item')} | "
               f"portion={result.get('portion_descriptor')} | "
               f"method={result.get('cooking_method')}")
+        if merged_modifiers:
+            print(f"   └─ macro modifiers : {merged_modifiers}")
+        if merged_excluded:
+            print(f"   └─ excluded items  : {merged_excluded}")
         if not result.get("is_safe", True):
             print(f"   🚫 BLOCKED: {result.get('rejection_reason')}")
         if not result.get("is_food_related", True):
@@ -478,29 +805,41 @@ def front_office_clean(raw_input: str) -> dict:
             if kw in raw_lower:
                 print(f"   🚫 Python safety net triggered: keyword [{kw}] detected")
                 return {
-                    "cleaned_input"     : raw_input,
-                    "food_item"         : raw_input,
-                    "portion_descriptor": "unknown",
-                    "quantity_multiplier": 1.0,
-                    "cooking_method"    : "unknown",
-                    "is_food_related"   : False,
-                    "is_safe"           : False,
-                    "rejection_reason"  : f"Harmful keyword detected: {kw}",
-                    "error"             : err_type,
+                    "cleaned_input"       : raw_input,
+                    "food_item"           : raw_input,
+                    "portion_descriptor"  : "unknown",
+                    "quantity_multiplier" : 1.0,
+                    "cooking_method"      : "unknown",
+                    "modifiers"           : [],
+                    "excluded_ingredients": [],
+                    "is_food_related"     : False,
+                    "is_safe"             : False,
+                    "rejection_reason"    : f"Harmful keyword detected: {kw}",
+                    "error"               : err_type,
                 }
 
         # No harmful keyword found — safe to degrade
         print(f"   └─ Degraded mode: passing raw input to agents unchanged")
+
+        # Python negation parser handles modifier + exclusion detection in degraded mode
+        parsed = parse_negations(raw_input)
+        if parsed["macro_modifiers"] or parsed["excluded_ingredients"]:
+            print(f"   └─ Python negation parser (degraded): "
+                  f"modifiers={parsed['macro_modifiers']} | "
+                  f"excluded={parsed['excluded_ingredients']}")
+
         return {
-            "cleaned_input"     : raw_input,
-            "food_item"         : raw_input,
-            "portion_descriptor": "unknown",
-            "quantity_multiplier": 1.0,
-            "cooking_method"    : "unknown",
-            "is_food_related"   : True,   # Assume true — agents will handle
-            "is_safe"           : True,
-            "rejection_reason"  : None,
-            "error"             : err_type,
+            "cleaned_input"       : raw_input,
+            "food_item"           : raw_input,
+            "portion_descriptor"  : "unknown",
+            "quantity_multiplier" : 1.0,
+            "cooking_method"      : "unknown",
+            "modifiers"           : parsed["macro_modifiers"],
+            "excluded_ingredients": parsed["excluded_ingredients"],
+            "is_food_related"     : True,
+            "is_safe"             : True,
+            "rejection_reason"    : None,
+            "error"               : err_type,
         }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -536,11 +875,17 @@ def collect_agent_opinions(user_input: str, rag_baseline: str, cleaned_memo: dic
                         f"- Portion            : {cleaned_memo.get('portion_descriptor', 'normal')}\n"
                         f"- Quantity multiplier: {cleaned_memo.get('quantity_multiplier', 1.0)}\n"
                         f"- Cooking method     : {cleaned_memo.get('cooking_method', 'unknown')}\n"
-                        f"- Full input         : {cleaned_memo.get('cleaned_input', user_input)}"
+                        f"- Macro modifiers    : {cleaned_memo.get('modifiers', [])}\n"
+                        f"- Excluded items     : {cleaned_memo.get('excluded_ingredients', [])}\n"
+                        f"- Full input         : {cleaned_memo.get('cleaned_input', user_input)}\n\n"
+                        f"MODIFIER REMINDER: If macro modifiers list is not empty, "
+                        f"you MUST apply them — internet data for affected nutrients is INVALID.\n"
+                        f"EXCLUSION REMINDER: If excluded_items list is not empty, "
+                        f"those ingredients are NOT in this dish — remove their calories/macros."
                     )},
                 ],
                 max_tokens  = 150,   # 3 sentences max
-                temperature = 0.4,
+                temperature = 0.0,   # Deterministic — no creativity, follow rules strictly
             )
             text = resp.choices[0].message.content.strip()
             # Strip chain-of-thought tags emitted by reasoning models
@@ -685,17 +1030,24 @@ def lead_audit(user_input: str, agent_responses: dict, rag_data: dict, cleaned_m
 
     audit_prompt = (
         f"CLEANED INPUT (from Front Office):\n"
-        f"- Food item     : {cleaned_memo.get('food_item', user_input)}\n"
-        f"- Portion       : {cleaned_memo.get('portion_descriptor', 'unknown')}\n"
-        f"- Cooking method: {cleaned_memo.get('cooking_method', 'unknown')}\n"
-        f"- is_safe       : {cleaned_memo.get('is_safe', True)}\n"
-        f"- is_food_related: {cleaned_memo.get('is_food_related', True)}\n"
-        f"- rejection_reason: {cleaned_memo.get('rejection_reason')}\n\n"
+        f"- Food item           : {cleaned_memo.get('food_item', user_input)}\n"
+        f"- Portion             : {cleaned_memo.get('portion_descriptor', 'unknown')}\n"
+        f"- Cooking method      : {cleaned_memo.get('cooking_method', 'unknown')}\n"
+        f"- Macro modifiers     : {cleaned_memo.get('modifiers', [])}\n"
+        f"- Excluded ingredients: {cleaned_memo.get('excluded_ingredients', [])}\n"
+        f"- is_safe             : {cleaned_memo.get('is_safe', True)}\n"
+        f"- is_food_related     : {cleaned_memo.get('is_food_related', True)}\n"
+        f"- rejection_reason    : {cleaned_memo.get('rejection_reason')}\n\n"
+        f"⚠️  MODIFIER ENFORCEMENT: If macro modifiers list above is NOT empty, "
+        f"apply GUARDRAIL 0 FIRST. Internet baseline for affected nutrients = INVALID.\n"
+        f"⚠️  EXCLUSION ENFORCEMENT: If excluded_ingredients is NOT empty, "
+        f"those items are ABSENT from this dish. Subtract their macro contribution "
+        f"from the internet baseline before computing final numbers.\n\n"
         f"RAG: {rag_baseline_trimmed}\n"
         f"STATUS: {status_note}\n\n"
         f"AGENT OPINIONS:\n{agent_context}\n\n"
-        f"Output JSON schema:\n{OUTPUT_SCHEMA}\n"
-        "Pure JSON only. First char { last char }."
+        f"Output the nutrition data as structured JSON matching the required schema. "
+        f"Pure JSON only. First char {{ last char }}."
     )
 
     # ── Log audit mode ────────────────────────────────────────────────────
@@ -711,28 +1063,112 @@ def lead_audit(user_input: str, agent_responses: dict, rag_data: dict, cleaned_m
     print(f"{chr(9472)*60}")
 
     # ── Call Lead Auditor (with 413/429 fallback) ─────────────────────────
-    def _call_auditor(model: str) -> str:
-        resp = client.chat.completions.create(
-            model       = model,
-            messages    = [
-                {"role": "system", "content": LEAD_AUDITOR["system"]},
-                {"role": "user",   "content": audit_prompt},
-            ],
-            max_tokens  = 450,
-            temperature = 0.1,
-        )
-        return resp.choices[0].message.content.strip()
+    def _call_auditor(model: str) -> dict:
+        """
+        Call Lead Auditor with Pydantic structured output enforcement.
+        response_format pins the LLM to FoodNutrientOutput schema at the API level.
+
+        Degradation ladder:
+        1. response_format + model_validate_json()  ← ideal path
+        2. ValidationError → manual json.loads() on same raw response
+        3. response_format not supported → plain call + manual json.loads()
+        4. Any other exception → re-raise to outer handler
+        """
+        from pydantic import ValidationError
+
+        # ── Attempt A: structured output via response_format ─────────────
+        try:
+            resp = client.chat.completions.create(
+                model           = model,
+                messages        = [
+                    {"role": "system", "content": LEAD_AUDITOR["system"]},
+                    {"role": "user",   "content": audit_prompt},
+                ],
+                max_tokens      = 350,
+                temperature     = 0.0,
+                response_format = {
+                    "type"  : "json_object",
+                    "schema": _FOOD_NUTRIENT_SCHEMA,
+                },
+            )
+            raw = resp.choices[0].message.content.strip()
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+
+            # ── Attempt B: Pydantic validation ───────────────────────────
+            try:
+                obj = FoodNutrientOutput.model_validate_json(raw)
+                return obj.model_dump()
+
+            except ValidationError as e_val:
+                # LLM dropped optional fields or sent wrong types.
+                # Raw JSON still arrived — parse it manually and fill missing fields.
+                print(f"  ⚠️  Pydantic ValidationError ({len(e_val.errors())} field(s)): "
+                      f"{[err['loc'] for err in e_val.errors()]}")
+                print(f"  └─ Graceful degradation: parsing raw JSON without strict validation")
+                raw = re.sub(r"```json|```", "", raw).strip()
+                m   = re.search(r"\{.*\}", raw, re.DOTALL)
+                raw = m.group(0) if m else raw
+                partial = json.loads(raw)
+                # Ensure required nutrition fields exist — if missing, raise to outer handler
+                for required_field in ("calories_kcal", "carbs_g", "protein_g", "fat_g"):
+                    if required_field not in partial:
+                        raise ValueError(
+                            f"Required field '{required_field}' missing even in degraded parse"
+                        )
+                # Fill missing optional fields with safe defaults
+                partial.setdefault("identified_item",      "Unknown")
+                partial.setdefault("is_healthy",           None)
+                partial.setdefault("macro_modifiers",      [])
+                partial.setdefault("excluded_ingredients", [])
+                partial.setdefault("audit_summary",        "")
+                partial.setdefault("status_voting",        "")
+                partial.setdefault("rag_source_used",      None)
+                partial.setdefault("portion_adjusted",     None)
+                partial["_degraded"] = True  # flag for logging
+                return partial
+
+        except Exception as e_fmt:
+            # ── Attempt C: model doesn't support response_format ─────────
+            err_str = str(e_fmt).lower()
+            if "response_format" in err_str or "not supported" in err_str or "unsupported" in err_str:
+                print(f"  ⚠️  response_format not supported by {model} — plain call fallback")
+                resp = client.chat.completions.create(
+                    model       = model,
+                    messages    = [
+                        {"role": "system", "content": LEAD_AUDITOR["system"]},
+                        {"role": "user",   "content": audit_prompt},
+                    ],
+                    max_tokens  = 450,
+                    temperature = 0.0,
+                )
+                raw = resp.choices[0].message.content.strip()
+                raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+                raw = re.sub(r"```json|```", "", raw).strip()
+                m   = re.search(r"\{.*\}", raw, re.DOTALL)
+                raw = m.group(0) if m else raw
+                return json.loads(raw)
+            raise  # Re-raise rate-limit / fatal errors to outer handler
 
     raw = None
     try:
-        raw = _call_auditor(LEAD_AUDITOR["model"])
+        result = _call_auditor(LEAD_AUDITOR["model"])
+        if result.get("_degraded"):
+            print(f"  ⚠️  Audit complete — degraded mode (ValidationError recovered)")
+        else:
+            print(f"  ✅ Audit complete — Pydantic-validated structured output")
+        return result
     except Exception as e_primary:
         err_str = str(e_primary)
         if "413" in err_str or "429" in err_str or "too_large" in err_str.lower() or "rate_limit" in err_str.lower():
             fb = LEAD_AUDITOR["fallback_model"]
             print(f"  🔄 Lead Auditor primary failed ({type(e_primary).__name__}), switching to {fb}")
             try:
-                raw = _call_auditor(fb)
+                result = _call_auditor(fb)
+                if result.get("_degraded"):
+                    print(f"  ⚠️  Audit complete via fallback — degraded mode")
+                else:
+                    print(f"  ✅ Audit complete via fallback — structured output")
+                return result
             except Exception as e_fb:
                 print(f"  ❌ Lead Auditor fallback also failed ({type(e_fb).__name__}): {str(e_fb)[:100]}")
                 return {"error": f"{type(e_fb).__name__}: {str(e_fb)[:200]}"}
@@ -740,30 +1176,18 @@ def lead_audit(user_input: str, agent_responses: dict, rag_data: dict, cleaned_m
             print(f"  ❌ Lead Auditor failed ({type(e_primary).__name__}): {str(e_primary)[:150]}")
             return {"error": f"{type(e_primary).__name__}: {str(e_primary)[:200]}"}
 
-    try:
-        raw    = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-        raw    = re.sub(r"```json|```", "", raw).strip()
-        m      = re.search(r"\{.*\}", raw, re.DOTALL)
-        raw    = m.group(0) if m else raw
-        result = json.loads(raw)
-        print(f"  ✅ Audit complete — valid JSON output")
-        return result
-
-    except json.JSONDecodeError as e:
-        raw_preview = (raw or "")[:300]
-        print(f"  ❌ Lead Auditor returned invalid JSON: {e}")
-        print(f"     Raw preview: {raw_preview}")
-        return {"error": "JSON parse failed", "raw_output": raw_preview}
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ENFORCE MATH — Python Arithmetic Lock (Zero-Gap Guarantee)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def enforce_math(result: dict) -> dict:
+def enforce_math(result: dict, cleaned_memo: dict = None) -> dict:
     """
     Post-processing lock: override LLM calorie hallucinations with pure Python math.
     Applies the Law of Conservation of Energy (4-4-9 rule) deterministically.
+
+    Also enforces modifier constraints at the Python level — a final safety net
+    in case LLM models ignored modifier instructions in their prompts.
 
     Rules:
     - calories_kcal = (carbs_g * 4) + (protein_g * 4) + (fat_g * 9)
@@ -777,14 +1201,73 @@ def enforce_math(result: dict) -> dict:
     if result.get("error"):
         return result  # Don't touch error responses
 
-    macros = result.get("macros", {})
-    # Round macros to nearest integer first, then do integer arithmetic.
-    # This ensures (carbs*4)+(protein*4)+(fat*9) == calories_kcal exactly.
-    c = int(round(float(macros.get("carbs_g",   0) or 0)))
-    p = int(round(float(macros.get("protein_g", 0) or 0)))
-    f = int(round(float(macros.get("fat_g",     0) or 0)))
+    # ── Python-level modifier enforcement (last line of defense) ─────────
+    # Even if LLM ignored the prompt instructions, Python will enforce it here.
+    if cleaned_memo:
+        modifiers     = cleaned_memo.get("modifiers", []) or []
+        food_item     = (cleaned_memo.get("food_item", "") or "").lower()
+        cleaned_input = (cleaned_memo.get("cleaned_input", "") or "").lower()
+        is_beverage   = any(w in food_item or w in cleaned_input for w in [
+            "kopi", "teh", "coffee", "tea", "susu", "milk", "juice",
+            "jus", "es", "minuman", "drink", "latte", "cappuccino",
+            "matcha", "boba", "bubble", "smoothie",
+        ])
+        has_milk = any(w in food_item or w in cleaned_input for w in [
+            "susu", "milk", "latte", "cappuccino", "kopi susu",
+            "matcha latte", "teh susu",
+        ])
 
-    # Write-back: push rounded values back into the JSON result object
+        if "no_sugar" in modifiers and is_beverage:
+            # Flat schema: carbs_g is top-level (Pydantic output)
+            # Legacy nested schema: result["macros"]["carbs_g"] — support both
+            current_carbs = float(
+                result.get("carbs_g") or
+                (result.get("macros") or {}).get("carbs_g") or 0
+            )
+            # Floor rules based on beverage type:
+            # - Dairy-based (susu, latte, etc.): lactose floor 9g, cap 15g
+            # - Fruit-based (jus, smoothie): natural fructose floor 8g, cap 18g
+            # - Black/plain (coffee, tea, no milk/fruit): cap 2g
+            has_fruit = any(w in food_item or w in cleaned_input for w in [
+                "jus", "juice", "smoothie", "buah", "jeruk", "mangga",
+                "apel", "pisang", "strawberry", "melon",
+            ])
+            if has_milk:
+                carb_floor, carb_cap = 9, 15
+            elif has_fruit:
+                carb_floor, carb_cap = 8, 18
+            else:
+                carb_floor, carb_cap = 0, 2
+
+            corrected = False
+            if current_carbs > carb_cap:
+                result["carbs_g"] = carb_cap
+                if "macros" in result:
+                    result["macros"]["carbs_g"] = carb_cap
+                corrected = True
+                result.setdefault("modifier_enforced", []).append(
+                    f"Python cap: no_sugar carbs_g capped at {carb_cap}g (was {int(current_carbs)}g)"
+                )
+            elif current_carbs < carb_floor:
+                result["carbs_g"] = carb_floor
+                if "macros" in result:
+                    result["macros"]["carbs_g"] = carb_floor
+                corrected = True
+                result.setdefault("modifier_enforced", []).append(
+                    f"Python floor: no_sugar dairy carbs_g raised to {carb_floor}g (was {int(current_carbs)}g — under-estimate)"
+                )
+
+    # ── Normalise to flat schema (Pydantic output) ────────────────────────
+    # FoodNutrientOutput has flat carbs_g/protein_g/fat_g (not nested under macros).
+    # enforce_math reads from flat fields; also supports legacy nested for safety.
+    c = int(round(float(result.get("carbs_g")   or (result.get("macros") or {}).get("carbs_g",   0) or 0)))
+    p = int(round(float(result.get("protein_g") or (result.get("macros") or {}).get("protein_g", 0) or 0)))
+    f = int(round(float(result.get("fat_g")     or (result.get("macros") or {}).get("fat_g",     0) or 0)))
+
+    # Write-back to flat fields (canonical) + legacy nested (backward compat)
+    result["carbs_g"]   = c
+    result["protein_g"] = p
+    result["fat_g"]     = f
     if "macros" in result:
         result["macros"]["carbs_g"]   = c
         result["macros"]["protein_g"] = p
@@ -868,7 +1351,7 @@ def assess(user_input: str, verbose: bool = True) -> dict:
     result = lead_audit(user_input, agent_responses, rag_data, cleaned_memo)
 
     # Stage 3 Post-Processing: Python arithmetic lock — override LLM calorie hallucinations
-    result = enforce_math(result)
+    result = enforce_math(result, cleaned_memo)
 
     if verbose:
         print(f"\n{'='*60}")
@@ -914,10 +1397,12 @@ def _format_human_readable(user_input: str, result: dict) -> str:
     # ── Extract fields ────────────────────────────────────────────────────
     item       = result.get("identified_item", "Not detected")
     calories   = result.get("calories_kcal", 0)
+    # Flat schema (Pydantic): carbs_g/protein_g/fat_g are top-level
+    # Legacy nested schema: result["macros"] — support both for safety
     macros     = result.get("macros", {})
-    carbs      = macros.get("carbs_g", 0)
-    protein    = macros.get("protein_g", 0)
-    fat        = macros.get("fat_g", 0)
+    carbs      = result.get("carbs_g")   or macros.get("carbs_g",   0)
+    protein    = result.get("protein_g") or macros.get("protein_g", 0)
+    fat        = result.get("fat_g")     or macros.get("fat_g",     0)
     is_healthy = result.get("is_healthy", False)
     audit_sum  = result.get("audit_summary", "")
 

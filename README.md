@@ -278,16 +278,18 @@ Results are printed live to notebook output — not pre-filled in this README.
 | Component | Technology | Role |
 |-----------|-----------|------|
 | Inference | [Groq](https://console.groq.com) (free tier) | All LLM calls |
-| Front Office | `groq/compound` | OCR fix · safety gate · entity extraction |
+| Front Office | `groq/compound` | OCR fix · safety gate · entity extraction · modifier detection |
 | Health Analyst | `llama-3.3-70b-versatile` | Health impact assessment |
 | Nutrition Engine | `meta-llama/llama-4-scout-17b-16e-instruct` | Macro interpolation |
-| Logic Auditor | `openai/gpt-oss-120b` | Skeptical validation |
-| Lead Auditor | `llama-3.3-70b-versatile` | Consensus audit · JSON output |
+| Logic Auditor | `openai/gpt-oss-120b` | Skeptical validation · modifier compliance audit |
+| Lead Auditor | `llama-3.3-70b-versatile` | Consensus audit · structured JSON output |
 | CB Fallback | `llama-3.1-8b-instant` | Circuit breaker (1K RPM, 560 t/s) |
 | RAG | `langchain-community` + DuckDuckGo | Internet nutrition baseline |
-| Math Lock | Python `enforce_math()` | Deterministic calorie calculation |
+| Schema | `Pydantic v2` `FoodNutrientOutput` | Structured output — replaces manual JSON parsing |
+| Math Lock | Python `enforce_math()` | Deterministic calorie calculation + modifier floor/cap |
+| Negation Parser | Python `parse_negations()` | Universal ingredient exclusion detection |
 | Runtime | Python 3.11+ · Jupyter Notebook | Development environment |
-| Output | Pure JSON | Flutter / SQL / AWS Lambda ready |
+| Output | Pure JSON (flat macros) | Flutter / SQL / AWS Lambda ready |
 
 ---
 
@@ -377,12 +379,17 @@ Every `RateLimitError`, `PermissionDeniedError`, and `ResourceExhausted` was poi
 
 ## Roadmap
 
-- [ ] Flutter mobile app integration (JSON output is already ready)
+- [x] Pydantic v2 structured outputs with graceful `ValidationError` degradation
+- [x] Universal negation parser — handles arbitrary ingredient exclusions (`tanpa kacang`, `no egg`, etc.)
+- [x] Nutrition floor rules — prevents modifier over-correction for dairy/carb/protein foods
+- [ ] Flutter mobile app integration (Samsung Galaxy Store target)
+- [ ] FastAPI endpoint wrapper (`POST /analyze`) for Flutter HTTP layer
 - [ ] AWS Lambda deployment for serverless inference
 - [ ] User profile persistence (daily log, BMI tracking)
 - [ ] Expand food database with local Indonesian products
-- [ ] Voice input pipeline (Whisper STT → assess())
-- [ ] Confidence scoring per nutrient field
+- [ ] Voice input pipeline (Whisper STT → `assess()`)
+- [ ] Warm-up ping endpoint to prevent HF Spaces cold start UX degradation
+- [ ] Redis caching layer (~60-80% hit rate target for common foods)
 
 ---
 
