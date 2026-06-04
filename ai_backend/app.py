@@ -82,7 +82,47 @@ class FoodNutrientOutput(BaseModel):
 _FOOD_NUTRIENT_SCHEMA = FoodNutrientOutput.model_json_schema()
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  NUTRITION FLOOR RULES
+#  JUMBO PORTION ENFORCEMENT RULES
+#  Injected into T2 Nutrition Engine, T3 Logic Auditor, and Lead Auditor.
+#  Purpose: force MAXIMUM WEIGHT on explicit cultural jumbo portion keywords.
+#  These keywords are NOT optional modifiers — they are mandatory multipliers.
+# ─────────────────────────────────────────────────────────────────────────────
+
+JUMBO_PORTION_RULES = """
+=== 🚨 HIGH-WEIGHT ENFORCEMENT: INDONESIAN JUMBO PORTION 🚨 ===
+
+You MUST give MAXIMUM WEIGHT and HIGHEST PRIORITY to cultural jumbo portion keywords.
+These keywords OVERRIDE the standard baseline IMMEDIATELY — no negotiation.
+
+── CRITICAL KEYWORDS (detect ANY of these) ───────────────────────────────────
+  TIER 1 — HIGHEST WEIGHT (1.7x–1.8x multiplier):
+    "porsi kuli", "nasi kuli", "porsi kuli banget", "makan kuli"
+
+  TIER 2 — HIGH WEIGHT (1.5x–1.7x multiplier):
+    "porsi gede", "porsi besar", "porsi jumbo", "porsi banyak",
+    "nasinya double", "nasi double", "double porsi", "extra large",
+    "jumbo", "banyak banget", "2x", "3x", "dobel"
+
+── MANDATORY CONVERSION WHEN KEYWORD DETECTED ────────────────────────────────
+  1. You are STRICTLY PROHIBITED from using the standard/typical baseline.
+  2. Multiply Carbohydrates and Total Calories by the factor above.
+  3. Rice component specifically: Tier 1 = ~400-500g cooked rice (vs normal 250g).
+                                  Tier 2 = ~350-400g cooked rice.
+  4. Side dishes (lauk) are also assumed larger — multiply protein and fat by 1.3x.
+
+── CONCRETE EXAMPLES (memorize these) ───────────────────────────────────────
+  Standard Nasi Padang + Rendang: ~800-900 kcal, ~90-100g carbs
+  "porsi kuli" Nasi Padang      : 1300-1500 kcal, ~160-180g carbs  ← MANDATORY
+  "porsi jumbo" Nasi Goreng     : 700-850 kcal, ~100-120g carbs    ← MANDATORY
+  "nasinya double" Ayam Geprek  : 800-950 kcal, ~110-130g carbs    ← MANDATORY
+
+── MANDATORY OUTPUT REQUIREMENTS ─────────────────────────────────────────────
+  - Set portion_adjusted = true (non-negotiable)
+  - audit_summary MUST state upscale reason explicitly, e.g.:
+    "Portion heavily upscaled (1.7x carbs) due to 'porsi kuli' specification."
+  - DO NOT soften the multiplier — use the full factor, not a partial one.
+  - If you output calories within normal range despite jumbo keyword → AUDIT FAILED.
+"""
 #  Injected into ALL agent system prompts and Lead Auditor GUARDRAIL 0.
 #  Purpose: prevent over-aggressive modifier application that zeros out
 #  naturally occurring nutrients (lactose, complex carbs, natural protein).
@@ -223,6 +263,8 @@ AGENTS = {
             "\n- PROTEIN CAP: For rice-based dishes without explicit extra meat, "
             "  protein should NOT exceed 25g for normal portion."
 
+            f"\n\n{JUMBO_PORTION_RULES}"
+
             "\n\nArgument format: [Internet: X kcal/Yg] -> [Modifier-adjusted: Z kcal] "
             "\n\nProvide specific adjusted numbers: calories, carbs, protein, fat. "
             "Respond in MAXIMUM 3 sentences. "
@@ -265,6 +307,8 @@ AGENTS = {
             "\n- Normal nasi goreng telur (1 plate): ~400-550 kcal, ~15-20g protein, ~60-75g carbs."
             "\n- Only validate large portions if user explicitly said: "
             "  porsi kuli, double, extra large, banyak banget, jumbo, 2x, 3x."
+
+            f"\n\n{JUMBO_PORTION_RULES}"
 
             "\n\nArgument format: [Internet Claim] vs [User Reality + Modifiers] = [Logical Verdict] "
             "\n\nBe direct, precise, unafraid to contradict inflated estimates. "
@@ -358,6 +402,7 @@ LEAD_AUDITOR = {
         "  Output: calories_kcal=798. Perfect — zero gap."
         "\n\n--- STEP B: CONTEXT-AWARE MACRO CONSTRAINTS ---"
         "\nApply these BEFORE Step A to set realistic starting values:"
+        f"\n\n{JUMBO_PORTION_RULES}"
         "\n\nRICE-BASED DISH (normal portion ~250-300g cooked): 350-600 kcal typical."
         "  Carb soft cap: 60-80g. Protein max 25g (no extra meat). Fat 10-25g."
         "\nNASI GORENG (fried rice): Fat MUST be 15-25g minimum due to frying oil."
@@ -369,8 +414,10 @@ LEAD_AUDITOR = {
         "  Rendang specifically: fat 30-45g due to coconut milk reduction."
         "\nCarb dominance rule: for rice dishes, carbs_g must be the largest single macro."
         "\n\n--- STEP C: PORTION LANGUAGE ---"
-        "\nOnly use 'laborer portion', 'large portion', 'jumbo' if portion_descriptor is 'large'/'extra_large'."
-        "For 'normal' portions: 'standard serving', '1 plate', 'typical portion'."
+        "\nOnly use 'laborer portion', 'large portion', 'jumbo' if portion_descriptor is 'large'/'extra_large' "
+        "OR if any JUMBO_PORTION_RULES keyword was detected in user input."
+        "\nFor 'normal' portions: 'standard serving', '1 plate', 'typical portion'."
+        "\nIf jumbo keyword detected: set portion_adjusted=true and state multiplier in audit_summary."
         "\nIf macro normalization was applied, state in audit_summary: "
         "'Macro-consistency normalization applied' or 'Gap redistributed to fat/protein/carbs'."
 
@@ -455,7 +502,10 @@ FRONT_OFFICE = {
         "\n4. PORTION STANDARDIZATION:"
         "   Default portion_descriptor = normal (1 standard serving ~250-300g cooked rice)."
         "   Set large/extra_large ONLY if user explicitly says: "
-        "   porsi kuli, double, extra large, banyak banget, jumbo, 2x, 3x."
+        "   porsi kuli, nasi kuli, porsi gede, porsi besar, porsi jumbo, porsi banyak, "
+        "   nasinya double, nasi double, double porsi, extra large, banyak banget, jumbo, 2x, 3x, dobel."
+        "   Set quantity_multiplier = 1.7 for 'porsi kuli' / 'nasi kuli' (Tier 1 — highest)."
+        "   Set quantity_multiplier = 1.5 for other large/jumbo keywords (Tier 2)."
         "   Set quantity_multiplier = numeric value if user states a count "
         "   (e.g., 2 gelas -> 2.0, setengah porsi -> 0.5, 5 biji -> 5.0, default 1.0)."
         "\n5. MODIFIER EXTRACTION — CRITICAL, DO NOT SKIP:"
@@ -1255,6 +1305,46 @@ def enforce_math(result: dict, cleaned_memo: dict = None) -> dict:
                 corrected = True
                 result.setdefault("modifier_enforced", []).append(
                     f"Python floor: no_sugar dairy carbs_g raised to {carb_floor}g (was {int(current_carbs)}g — under-estimate)"
+                )
+
+        # ── Python-level jumbo portion enforcement (safety net) ───────────
+        # If LLM ignored jumbo keywords and returned normal-range calories,
+        # Python forces the multiplier as a hard floor.
+        raw_input_full = (
+            cleaned_input + " " + food_item + " " +
+            (cleaned_memo.get("raw_input", "") or "").lower()
+        )
+        JUMBO_TIER1 = ["porsi kuli", "nasi kuli", "makan kuli", "porsi kuli banget"]
+        JUMBO_TIER2 = [
+            "porsi gede", "porsi besar", "porsi jumbo", "porsi banyak",
+            "nasinya double", "nasi double", "double porsi",
+            "jumbo", "banyak banget", "dobel",
+        ]
+        is_tier1 = any(kw in raw_input_full for kw in JUMBO_TIER1)
+        is_tier2 = any(kw in raw_input_full for kw in JUMBO_TIER2)
+
+        if is_tier1 or is_tier2:
+            multiplier   = 1.75 if is_tier1 else 1.55
+            tier_label   = "porsi kuli (Tier 1)" if is_tier1 else "jumbo portion (Tier 2)"
+            current_cal  = float(result.get("calories_kcal") or 0)
+            current_carb = float(result.get("carbs_g") or (result.get("macros") or {}).get("carbs_g", 0) or 0)
+
+            # Normal rice meal ceiling: 700 kcal. If LLM output is below this
+            # despite jumbo keyword, force multiply.
+            NORMAL_CEILING = 700
+            if current_cal < NORMAL_CEILING and current_cal > 0:
+                new_cal  = int(round(current_cal  * multiplier))
+                new_carb = int(round(current_carb * multiplier))
+
+                result["calories_kcal"] = new_cal
+                result["carbs_g"]       = new_carb
+                if "macros" in result:
+                    result["macros"]["carbs_g"] = new_carb
+                result["portion_adjusted"] = True
+                result.setdefault("modifier_enforced", []).append(
+                    f"Python jumbo-floor: {tier_label} detected — "
+                    f"calories {int(current_cal)}→{new_cal} kcal, "
+                    f"carbs {int(current_carb)}→{new_carb}g ({multiplier}x)"
                 )
 
     # ── Normalise to flat schema (Pydantic output) ────────────────────────

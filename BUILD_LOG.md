@@ -1125,3 +1125,67 @@ zero-gap guarantee: still holds after floor/cap correction ✅
 - [ ] Flutter mobile app (Samsung Galaxy Store target)
 - [ ] Whisper STT → `assess()` pipeline for voice input
 - [ ] Warm-up ping endpoint to prevent HF Spaces cold start UX degradation
+
+---
+
+## 28. BUGFIX — Jumbo Portion Regression (June 4, 2026)
+
+### Problem
+
+AI was treating `"porsi kuli"` and similar jumbo portion keywords as standard portions — outputting normal-range calories (~500 kcal) for inputs that should produce 1200-1500 kcal.
+
+### Root Cause
+
+The existing `portion_descriptor = large/extra_large` instruction in Front Office was too soft. Agents received `portion_descriptor: large` but no explicit multiplier mandate — each agent interpreted it differently, and the Lead Auditor defaulted to "scale up by 1.5x-2x" without enforcement. With temperature 0.0, the model picked the conservative end (1.5x) or ignored it entirely.
+
+### Solution: `JUMBO_PORTION_RULES` Constant
+
+A dedicated constant injected into **3 places** (T2 Nutrition Engine, T3 Logic Auditor, Lead Auditor STEP B):
+
+```
+TIER 1 (1.75x Python multiplier):
+  "porsi kuli", "nasi kuli", "makan kuli", "porsi kuli banget"
+
+TIER 2 (1.55x Python multiplier):
+  "porsi gede", "porsi besar", "porsi jumbo", "porsi banyak",
+  "nasinya double", "nasi double", "double porsi",
+  "jumbo", "banyak banget", "dobel", "2x", "3x"
+```
+
+Concrete examples hardcoded into the rules:
+- Standard Nasi Padang + Rendang: ~800-900 kcal
+- "porsi kuli" Nasi Padang: **1300-1500 kcal MANDATORY**
+
+### Python Hard Floor in `enforce_math`
+
+Even if all 3 agents + Lead Auditor ignore the rules, Python forces the multiplier:
+
+```python
+if is_tier1 or is_tier2:
+    multiplier = 1.75 if is_tier1 else 1.55
+    if current_cal < NORMAL_CEILING (700 kcal):
+        → multiply calories and carbs
+        → set portion_adjusted = True
+        → log to modifier_enforced
+```
+
+The `NORMAL_CEILING = 700` guard prevents double-multiplication when LLM already got it right.
+
+### No Regression on Floor Rules
+
+Both `JUMBO_PORTION_RULES` and `NUTRITION_FLOOR_RULES` coexist:
+- Floor rules apply to beverages (no_sugar carbs floor/cap)
+- Jumbo rules apply to food/rice dishes
+- Python enforce_math runs both checks independently
+
+### Verification
+
+```
+porsi kuli nasi padang (LLM: 500 kcal) → 1132 kcal ✅
+porsi jumbo nasi goreng (LLM: 450 kcal) → 639 kcal ✅
+Already jumbo (1300 kcal) → no double-multiply (1335 kcal) ✅
+Normal nasi goreng → not upscaled ✅
+susu coklat tanpa gula → floor rules still work ✅
+```
+
+Front Office also updated: `quantity_multiplier = 1.7` for `porsi kuli` / `nasi kuli` (Tier 1).
